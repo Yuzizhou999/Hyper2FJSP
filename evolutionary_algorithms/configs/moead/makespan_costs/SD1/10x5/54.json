@@ -1,0 +1,15 @@
+{
+    "problem_instance": "/SD1/10x5/3228_10j_5m.fjs",
+    "nr_of_objectives": 2,
+    "objective_names": [
+        "makespan",
+        "costs"
+    ],
+    "population_size": 100,
+    "ngen": 80000,
+    "rseed": 5,
+    "indpb": 0.02,
+    "cr": 0.7,
+    "logbook": true,
+    "plotting": false
+}
