@@ -3,11 +3,11 @@ import os
 from glob import glob
 from typing import Dict, Optional
 
-import hvwfg
 import numpy as np
 
 from data_utils import pack_data_from_config
 from enums import ObjectiveFn
+from hypervolume_utils import compute_hypervolume
 from mo_fjsp_env_various_op_nums import MOFJSPEnvForVariousOpNums
 from params import configs
 
@@ -177,7 +177,7 @@ def read_or_tools_solutions(
 
             # Compute normalized hypervolume for each instance using sensible reference points
             pareto_set = find_pareto_efficient_solutions(instance_points[instance])
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 pareto_set - env.objective_lower_bounds[instance],
                 reference_points[instance] - env.objective_lower_bounds[instance] + 1e-8,
             ) / np.prod(reference_points[instance] - env.objective_lower_bounds[instance] + 1e-8)
@@ -198,7 +198,7 @@ def read_or_tools_solutions(
                 data[1][instance: instance + 1],
                 deadline_alpha=configs.deadline_alpha,
             )
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 pareto_set - env.objective_lower_bounds[0],
                 reference_points[instance] - env.objective_lower_bounds[0] + 1e-8,
             ) / np.prod(reference_points[instance] - env.objective_lower_bounds[0] + 1e-8)

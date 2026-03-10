@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from model.attention_layer import MultiHeadMchAttnBlock, MultiHeadOpAttnBlock
 from model.hyper_network import AttentionPooling, HyperActor
 from model.sub_layers import Critic
+from model.main_model import DualAttentionNetwork
 
 
 class HYPER_DANIEL(nn.Module):
@@ -30,40 +31,38 @@ class HYPER_DANIEL(nn.Module):
         self.embedding_output_dim = config.layer_fea_output_dim[-1]
 
         # 使用与 DANIEL 相同的特征提取网络
-        # 在此处导入以避免循环依赖
-        from model.main_model import DualAttentionNetwork
-
         self.feature_exact = DualAttentionNetwork(config).to(device)
 
         # 根据目标函数数量确定偏好维度
         pref_dim = (
             len(config.objective_fn) if isinstance(config.objective_fn, list) else 2
         )
+        self.use_instance_features = getattr(
+            config, "hyper_use_instance_features", False
+        )
 
-        # === 改进 1: 注意力池化 ===
-        # 使用可学习的注意力权重替代 nonzero_averaging，
-        # 为全局特征提供更具表达力的聚合方式
+        # 使用可学习的注意力权重替代 nonzero_averaging，为全局特征提供更具表达力的聚合方式
         self.attn_pool_j = AttentionPooling(self.embedding_output_dim).to(device)
         self.attn_pool_m = AttentionPooling(self.embedding_output_dim).to(device)
 
-        # === 改进 2: 实例感知超网络 ===
-        # 将问题实例的全局特征注入超网络，使生成的 Actor 参数
-        # 不仅取决于偏好向量，还取决于当前问题实例的特征
-        instance_dim = 2 * self.embedding_output_dim  # cat(fea_j_global, fea_m_global)
+        # 将问题实例的全局特征注入超网络，使生成的 Actor 参数不仅取决于偏好向量，还取决于当前问题实例的特征
+        instance_dim = (
+            2 * self.embedding_output_dim if self.use_instance_features else 0
+        )
 
-        # 使用 HyperActor 替代普通 Actor（增加 instance_dim 支持）
+        # 增加 instance_dim 支持实例感知超网络
         self.actor = HyperActor(
             num_layers=config.num_mlp_layers_actor,
             input_dim=4 * self.embedding_output_dim + self.pair_input_dim,
             hidden_dim=config.hidden_dim_actor,
             output_dim=1,
             pref_dim=pref_dim,
-            hyper_hidden_dim=256,  # 遵循示例模式
-            embd_dim=2,  # 遵循示例模式
+            hyper_hidden_dim=config.hyper_hidden_dim,
+            embd_dim=config.hyper_embd_dim,
             instance_dim=instance_dim,
         ).to(device)
 
-        # 存储当前偏好（用于实例感知的逐步 assign）
+        # 存储当前偏好；仅在 preference-only 模式下预生成 Actor 参数
         self.current_preferences = None
 
         # Critic 配置
@@ -77,14 +76,16 @@ class HYPER_DANIEL(nn.Module):
 
     def assign_preferences(self, preferences):
         """
-        存储偏好向量，实际的参数生成延迟到 forward() 中执行。
-        在实例感知模式下，超网络的输入包含偏好和实例特征，
-        因此必须在获得实例特征后才能生成 Actor 参数。
+        存储偏好向量。
+        在 preference-only 模式下可直接预生成 Actor 参数；
+        在实例感知模式下，需要等 forward() 获得实例特征后再生成。
 
         :param preferences: 偏好向量 [batch_size, pref_dim]
                            批次中的每个样本可以有不同的偏好
         """
         self.current_preferences = preferences
+        if not self.use_instance_features:
+            self.actor.assign(preferences)
 
     def forward(
         self,
@@ -149,9 +150,7 @@ class HYPER_DANIEL(nn.Module):
             selected_fea_m_params = fea_m_params[preference_indices]
             fea_m = fea_m + selected_fea_m_params
 
-        # === 改进 1: 使用注意力池化计算全局特征 ===
-        # 替代 DualAttentionNetwork 中的 nonzero_averaging，
-        # 让模型可学习地决定各节点对全局表示的贡献
+        # 使用注意力池化计算全局特征，让模型可学习地决定各节点对全局表示的贡献
         fea_j_global = self.attn_pool_j(fea_j)  # [sz_b, d]
         fea_m_global = self.attn_pool_m(fea_m)  # [sz_b, d]
 
@@ -184,9 +183,7 @@ class HYPER_DANIEL(nn.Module):
             dim=-1,
         )
 
-        # === 改进 2: 实例感知超网络 ===
-        # 将注意力池化得到的全局特征作为实例信息注入超网络，
-        # 使 Actor 参数同时取决于偏好向量和当前问题实例
+        # 实例感知超网络,将注意力池化得到的全局特征作为实例信息注入超网络，使 Actor 参数同时取决于偏好向量和当前问题实例
         instance_global = torch.cat([fea_j_global, fea_m_global], dim=-1)  # [sz_b, 2*d]
 
         # 确定当前批次使用的偏好向量
@@ -204,9 +201,17 @@ class HYPER_DANIEL(nn.Module):
                 "必须在前向传播前调用 assign_preferences() 或传入 preferences 参数！"
             )
 
-        # 使用偏好 + 实例特征生成 Actor 参数并前向传播
-        self.actor.assign(batch_prefs, instance_features=instance_global)
-        candidate_scores = self.actor(candidate_feature)
+        actor_preference_indices = None
+        if self.use_instance_features:
+            self.actor.assign(batch_prefs, instance_features=instance_global)
+        elif preferences is not None:
+            self.actor.assign(batch_prefs)
+        elif preference_indices is not None:
+            actor_preference_indices = preference_indices
+
+        candidate_scores = self.actor(
+            candidate_feature, preference_indices=actor_preference_indices
+        )
         candidate_scores = candidate_scores.squeeze(-1)
 
         # 掩码不兼容的操作-机器对

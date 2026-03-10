@@ -1,7 +1,6 @@
 import copy
 import time
 
-import hvwfg
 import numpy as np
 import torch
 
@@ -14,6 +13,7 @@ from common_utils import (
 )
 from data_utils import load_data_from_files
 from enums import ObjectiveFn
+from hypervolume_utils import compute_hypervolume
 from mo_fjsp_env_same_op_nums import MOFJSPEnvForSameOpNums
 from mo_fjsp_env_various_op_nums import MOFJSPEnvForVariousOpNums
 
@@ -154,8 +154,16 @@ class MOTrainer(train.Trainer):
         # Add no-LB-features suffix
         no_lb_suffix = "_NoLB" if not getattr(config, "use_lb_features", True) else ""
 
+        hyper_mode_suffix = ""
+        if config.model_architecture.value == "hyper_daniel":
+            hyper_mode_suffix = (
+                "_inst"
+                if getattr(config, "hyper_use_instance_features", False)
+                else "_pref_only"
+            )
+
         # Create the model name with the objective suffix
-        self.model_name = f"{self.data_name}{strToSuffix(config.model_suffix)}_{config.model_architecture.value}{'_no_trans' if config.use_gamma_beta is False else ''}{'_large' if config.hidden_dim_actor > 65 else ''}{obj_suffix}{single_critic_suffix}{simple_reward_suffix}{no_lb_suffix}_MO"
+        self.model_name = f"{self.data_name}{strToSuffix(config.model_suffix)}_{config.model_architecture.value}{hyper_mode_suffix}{'_no_trans' if config.use_gamma_beta is False else ''}{'_large' if config.hidden_dim_actor > 65 else ''}{obj_suffix}{single_critic_suffix}{simple_reward_suffix}{no_lb_suffix}_MO"
 
     def _set_initial_rewards(self):
         # Initialize episode rewards to zero
@@ -369,7 +377,7 @@ class MOTrainer(train.Trainer):
                 i * self.num_preferences_validation
             ]
             lower_bounds = all_lower_bounds[lb_indices]
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 find_pareto_efficient_solutions(eval_objectives[i]) - lower_bounds,
                 self.vali_reference_points[i][reference_point_indices] - lower_bounds,
             ) / np.prod(
@@ -540,7 +548,7 @@ class MOTrainer(train.Trainer):
                 i * self.num_preferences_validation
             ]
             lower_bounds = all_lower_bounds[lb_indices]
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 find_pareto_efficient_solutions(eval_objectives[i]) - lower_bounds,
                 self.vali_reference_points[i][reference_point_indices] - lower_bounds,
             ) / np.prod(

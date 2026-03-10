@@ -149,6 +149,8 @@ parser.add_argument('--hyper_hidden_dim', type=int, default=256,
                     help='Hidden dimension for hypernetwork (used with hyper_daniel architecture)')
 parser.add_argument('--hyper_embd_dim', type=int, default=2,
                     help='Embedding dimension for hypernetwork parameter generation (used with hyper_daniel architecture)')
+parser.add_argument('--hyper_use_instance_features', type=str2bool, default=False,
+                    help='Whether HYPER conditions the hypernetwork on pooled instance features in addition to preferences')
 
 
 parser.add_argument('--single_value_critic', type=str2bool, default=False, help='Whether to use a single value critic for PPO')

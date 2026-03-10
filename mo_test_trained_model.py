@@ -4,7 +4,6 @@ import sys
 import time
 from collections import defaultdict
 
-import hvwfg
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -13,11 +12,13 @@ from common_utils import (
     das_dennis,
     find_pareto_efficient_solutions,
     greedy_select_action,
+    is_pareto_efficient,
     sample_action,
     setup_seed,
 )
 from data_utils import pack_data_from_config
 from enums import ObjectiveFn
+from hypervolume_utils import compute_hypervolume
 from mo_fjsp_env_same_op_nums import MOFJSPEnvForSameOpNums
 from model.PPO import PPO_initialize
 from params import configs
@@ -56,6 +57,95 @@ def save_pareto_sets(pareto_sets, data_source, data_name, model_name, strategy):
     print(f"Saved {len(pareto_sets)} Pareto sets to {save_dir}")
 
 
+def save_preference_response(
+    preferences,
+    objectives,
+    pareto_mask,
+    objective_names,
+    data_source,
+    data_name,
+    model_name,
+    strategy,
+    instance_index,
+):
+    """
+    Save preference-conditioned objective values for one test instance.
+
+    Args:
+        preferences: Preference vectors with shape [num_points, pref_dim]
+        objectives: Objective vectors with shape [num_points, num_objectives]
+        pareto_mask: Boolean mask of nondominated solutions
+        objective_names: Ordered objective names matching the columns in objectives
+    """
+    save_dir = f"./preference_responses/{data_source}/{data_name}/{model_name}_{strategy}"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    save_path = f"{save_dir}/instance_{instance_index}.npz"
+    np.savez(
+        save_path,
+        preferences=np.asarray(preferences),
+        objectives=np.asarray(objectives),
+        pareto_mask=np.asarray(pareto_mask, dtype=bool),
+        objective_names=np.asarray(objective_names),
+    )
+
+
+def collect_eval_objectives(env, objective_fn, cost_reference_index=None):
+    eval_objectives = []
+    reference_point_indices = []
+    lb_indices = []
+    objective_names = []
+
+    if ObjectiveFn.MAKESPAN in objective_fn:
+        eval_objectives.append(env.current_makespan)
+        reference_point_indices.append(0)
+        lb_indices.append(env.objectives.index(ObjectiveFn.MAKESPAN))
+        objective_names.append(ObjectiveFn.MAKESPAN.value)
+    if ObjectiveFn.AVERAGE_FLOWTIME in objective_fn:
+        eval_objectives.append(env.compute_avg_flowtime())
+        reference_point_indices.append(1)
+        lb_indices.append(env.objectives.index(ObjectiveFn.AVERAGE_FLOWTIME))
+        objective_names.append(ObjectiveFn.AVERAGE_FLOWTIME.value)
+    if ObjectiveFn.TOTAL_TARDINESS in objective_fn:
+        eval_objectives.append(env.compute_total_tardiness())
+        reference_point_indices.append(2)
+        lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_TARDINESS))
+        objective_names.append(ObjectiveFn.TOTAL_TARDINESS.value)
+    if ObjectiveFn.TOTAL_EARLINESS in objective_fn:
+        eval_objectives.append(env.compute_total_earliness())
+        if configs.deadline_alpha <= 0.51:
+            reference_point_indices.append(3)
+        elif configs.deadline_alpha <= 0.91:
+            reference_point_indices.append(4)
+        else:
+            reference_point_indices.append(5)
+        lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_EARLINESS))
+        objective_names.append(ObjectiveFn.TOTAL_EARLINESS.value)
+    if ObjectiveFn.COSTS in objective_fn:
+        eval_objectives.append(env.compute_costs())
+        if cost_reference_index is not None:
+            reference_point_indices.append(cost_reference_index)
+        lb_indices.append(env.objectives.index(ObjectiveFn.COSTS))
+        objective_names.append(ObjectiveFn.COSTS.value)
+    normalization_values = copy.deepcopy(reference_point_indices)
+    if ObjectiveFn.NEGATIVE_MAKESPAN in objective_fn:
+        eval_objectives.append(-env.current_makespan)
+        reference_point_indices.append(-1)
+        normalization_values.append(0)
+        lb_indices.append(env.objectives.index(ObjectiveFn.NEGATIVE_MAKESPAN))
+        objective_names.append(ObjectiveFn.NEGATIVE_MAKESPAN.value)
+
+    eval_objectives = np.stack(eval_objectives, axis=1)
+    return (
+        eval_objectives,
+        reference_point_indices,
+        lb_indices,
+        normalization_values,
+        objective_names,
+    )
+
+
 def test_greedy_strategy(
     data_set,
     model_path,
@@ -78,7 +168,7 @@ def test_greedy_strategy(
     test_result_list = []
 
     setup_seed(seed)
-    ppo.policy.load_state_dict(torch.load(model_path, map_location="cuda"))
+    ppo.policy.load_state_dict(torch.load(model_path, map_location=device))
     ppo.policy.eval()
 
     # Detect use_lb_features from model name
@@ -138,6 +228,7 @@ def test_greedy_strategy(
         preferences = torch.from_numpy(preferences).float().to(device)
     else:
         raise NotImplementedError("Unsupported number of objectives.")
+    preferences_np = preferences.detach().cpu().numpy()
     original_data_set_size = len(data_set[0])
     data_set = (
         # list(np.repeat(data_set[0], num_preferences, axis=0))
@@ -182,46 +273,18 @@ def test_greedy_strategy(
             if done.all():
                 break
         t2 = time.time()
-        env.current_makespan[0]
-        eval_objectives = []
-        reference_point_indices = []
-        lb_indices = []  # Track which index in objective_lower_bounds corresponds to each eval_objective
-        if ObjectiveFn.MAKESPAN in objective_fn:
-            eval_objectives.append(env.current_makespan)
-            reference_point_indices.append(0)
-            lb_indices.append(env.objectives.index(ObjectiveFn.MAKESPAN))
-        if ObjectiveFn.AVERAGE_FLOWTIME in objective_fn:
-            eval_objectives.append(env.compute_avg_flowtime())
-            reference_point_indices.append(1)
-            lb_indices.append(env.objectives.index(ObjectiveFn.AVERAGE_FLOWTIME))
-        if ObjectiveFn.TOTAL_TARDINESS in objective_fn:
-            eval_objectives.append(env.compute_total_tardiness())
-            reference_point_indices.append(2)
-            lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_TARDINESS))
-        if ObjectiveFn.TOTAL_EARLINESS in objective_fn:
-            eval_objectives.append(env.compute_total_earliness())
-            # Map deadline_alpha to appropriate earliness reference point index
-            # Index 3: alpha=0.5, Index 4: alpha=0.9, Index 5: alpha=1.0
-            if configs.deadline_alpha <= 0.51:
-                reference_point_indices.append(3)  # alpha 0.5
-            elif configs.deadline_alpha <= 0.91:
-                reference_point_indices.append(4)  # alpha 0.9
-            else:
-                reference_point_indices.append(5)  # alpha 1.0
-            lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_EARLINESS))
-        if ObjectiveFn.COSTS in objective_fn:
-            eval_objectives.append(env.compute_costs())
-            reference_point_indices.append(len(reference_points[0]) - 1)
-            lb_indices.append(env.objectives.index(ObjectiveFn.COSTS))
-        normalization_values = copy.deepcopy(reference_point_indices)
-        if ObjectiveFn.NEGATIVE_MAKESPAN in objective_fn:
-            eval_objectives.append(-env.current_makespan)
-            reference_point_indices.append(-1)
-            normalization_values.append(0)
-            lb_indices.append(env.objectives.index(ObjectiveFn.NEGATIVE_MAKESPAN))
-
-        eval_objectives = np.stack(eval_objectives, axis=1)
-        eval_objectives = eval_objectives.reshape(1, num_preferences, -1)
+        (
+            eval_objectives,
+            reference_point_indices,
+            lb_indices,
+            normalization_values,
+            objective_names,
+        ) = collect_eval_objectives(
+            env, objective_fn, cost_reference_index=len(reference_points[0]) - 1
+        )
+        per_preference_objectives = eval_objectives.reshape(num_preferences, -1)
+        pareto_mask = is_pareto_efficient(per_preference_objectives)
+        eval_objectives = per_preference_objectives.reshape(1, num_preferences, -1)
         normalized_hypervolumes = []
         for j in range(eval_objectives.shape[0]):
             print(
@@ -232,7 +295,7 @@ def test_greedy_strategy(
             # Reorder lower bounds to match the order of objectives using lb_indices
             all_lower_bounds = env.objective_lower_bounds[0]
             lower_bounds = all_lower_bounds[lb_indices]
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 pareto_set - lower_bounds,
                 reference_points[i][reference_point_indices] - lower_bounds + 1e-8,
             ) / np.prod(reference_points[i][normalization_values] - lower_bounds + 1e-8)
@@ -242,6 +305,18 @@ def test_greedy_strategy(
         test_result_list.append(
             [normalized_hypervolume, num_solutions_in_pareto_set, t2 - t1]
         )
+        if model_name and data_source and data_name:
+            save_preference_response(
+                preferences_np,
+                per_preference_objectives,
+                pareto_mask,
+                objective_names,
+                data_source,
+                data_name,
+                model_name,
+                "greedy",
+                i,
+            )
 
     # Save the Pareto sets if model_name is provided
     if model_name and data_source and data_name:
@@ -268,7 +343,7 @@ def test_sampling_strategy(
     all_cycles_performance_metrics = []  # Store performance metrics for each cycle
 
     setup_seed(seed)
-    ppo.policy.load_state_dict(torch.load(model_path, map_location="cuda"))
+    ppo.policy.load_state_dict(torch.load(model_path, map_location=device))
     ppo.policy.eval()
 
     # Detect use_lb_features from model name
@@ -340,6 +415,7 @@ def test_sampling_strategy(
         preferences = torch.from_numpy(preferences).float().to(device)
     else:
         raise NotImplementedError("Unsupported number of objectives.")
+    preferences_np = preferences.detach().cpu().numpy()
     original_data_set_size = len(data_set[0])
     data_set = (
         [i for i in data_set[0] for _ in range(num_preferences * sample_times)],
@@ -432,48 +508,17 @@ def test_sampling_strategy(
                 if done.all():
                     break
             t2 = time.time()
-            env.current_makespan[0]
-            eval_objectives = []
-            reference_point_indices = []
-            lb_indices = []  # Track which index in objective_lower_bounds corresponds to each eval_objective
-            if ObjectiveFn.MAKESPAN in objective_fn:
-                eval_objectives.append(env.current_makespan)
-                reference_point_indices.append(0)
-                lb_indices.append(env.objectives.index(ObjectiveFn.MAKESPAN))
-            if ObjectiveFn.AVERAGE_FLOWTIME in objective_fn:
-                eval_objectives.append(env.compute_avg_flowtime())
-                reference_point_indices.append(1)
-                lb_indices.append(env.objectives.index(ObjectiveFn.AVERAGE_FLOWTIME))
-            if ObjectiveFn.TOTAL_TARDINESS in objective_fn:
-                eval_objectives.append(env.compute_total_tardiness())
-                reference_point_indices.append(2)
-                lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_TARDINESS))
-            if ObjectiveFn.TOTAL_EARLINESS in objective_fn:
-                eval_objectives.append(env.compute_total_earliness())
-                # Map deadline_alpha to appropriate earliness reference point index
-                # Index 3: alpha=0.5, Index 4: alpha=0.9, Index 5: alpha=1.0
-                if configs.deadline_alpha <= 0.51:
-                    reference_point_indices.append(3)  # alpha 0.5
-                elif configs.deadline_alpha <= 0.91:
-                    reference_point_indices.append(4)  # alpha 0.9
-                else:
-                    reference_point_indices.append(5)  # alpha 1.0
-                lb_indices.append(env.objectives.index(ObjectiveFn.TOTAL_EARLINESS))
-            if ObjectiveFn.COSTS in objective_fn:
-                eval_objectives.append(env.compute_costs())
-                reference_point_indices.append(len(reference_points[0]) - 1)
-                lb_indices.append(env.objectives.index(ObjectiveFn.COSTS))
-            normalization_values = copy.deepcopy(reference_point_indices)
-            if ObjectiveFn.NEGATIVE_MAKESPAN in objective_fn:
-                eval_objectives.append(-env.current_makespan)
-                reference_point_indices.append(-1)
-                normalization_values.append(0)
-                lb_indices.append(env.objectives.index(ObjectiveFn.NEGATIVE_MAKESPAN))
-
-            eval_objectives = np.stack(eval_objectives, axis=1)
-            eval_objectives = eval_objectives.reshape(
-                num_preferences * sample_times, -1
+            (
+                eval_objectives,
+                reference_point_indices,
+                lb_indices,
+                normalization_values,
+                objective_names,
+            ) = collect_eval_objectives(
+                env, objective_fn, cost_reference_index=len(reference_points[0]) - 1
             )
+
+            eval_objectives = eval_objectives.reshape(num_preferences * sample_times, -1)
 
             # Add solutions from this cycle to accumulated solutions
             accumulated_solutions.append(eval_objectives)
@@ -482,6 +527,7 @@ def test_sampling_strategy(
             all_solutions_so_far = np.vstack(
                 accumulated_solutions
             )  # Shape: [total_solutions_so_far, num_objectives]
+            all_preferences_so_far = np.tile(preferences_np, (cycle + 1, 1))
 
             print(
                 f"Cycle {cycle + 1}: Added {len(eval_objectives)} solutions. "
@@ -491,13 +537,14 @@ def test_sampling_strategy(
 
             # Compute Pareto set from all accumulated solutions
             pareto_set = find_pareto_efficient_solutions(all_solutions_so_far)
+            pareto_mask = is_pareto_efficient(all_solutions_so_far)
             print(f"Accumulated Pareto set size: {len(pareto_set)}")
 
             # Compute hypervolume of accumulated Pareto set
             # Reorder lower bounds to match the order of objectives using lb_indices
             all_lower_bounds = env.objective_lower_bounds[0]
             lower_bounds = all_lower_bounds[lb_indices]
-            normalized_hypervolume = hvwfg.wfg(
+            normalized_hypervolume = compute_hypervolume(
                 pareto_set - lower_bounds,
                 reference_points[i][reference_point_indices] - lower_bounds + 1e-8,
             ) / np.prod(reference_points[i][normalization_values] - lower_bounds + 1e-8)
@@ -536,6 +583,20 @@ def test_sampling_strategy(
                         os.makedirs(save_dir)
                     save_path = f"{save_dir}/instance_{i}.npy"
                     np.save(save_path, pareto_set_data)
+
+                save_preference_response(
+                    all_preferences_so_far,
+                    all_solutions_so_far,
+                    pareto_mask,
+                    objective_names,
+                    data_source,
+                    data_name,
+                    model_name,
+                    f"sampling_cycle{cycle + 1}"
+                    if num_sampling_cycles > 1
+                    else "sampling",
+                    i,
+                )
 
     return np.array(test_result_list), performance_metrics
 
