@@ -226,6 +226,7 @@ class PPO:
         self.vloss_coef = config.vloss_coef
         self.entloss_coef = config.entloss_coef
         self.minibatch_size = config.minibatch_size
+        self.max_grad_norm = config.max_grad_norm
 
         # Choose model based on architecture and multi-objective flag
         if multi_objective:
@@ -279,6 +280,12 @@ class PPO:
         self.V_loss_2 = nn.MSELoss()
         self.device = torch.device(config.device)
 
+    def _clip_gradients(self):
+        if self.max_grad_norm is not None and self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), self.max_grad_norm
+            )
+
     def update(
         self,
         memory: Memory,
@@ -292,160 +299,87 @@ class PPO:
         :return: total_loss and critic_loss
         """
         obj_weight_input = objective_weights is not None
+        t_data = memory.transpose_data()
 
         if obj_weight_input and not single_value_critic:
-            t_data = memory.transpose_data()
-
             t_advantage_seq, v_target_seq = memory.get_gae_advantages(
                 objective_weights=objective_weights
             )
-
-            full_batch_size = len(t_data[-1])
-            num_batch = np.ceil(full_batch_size / self.minibatch_size)
-
-            loss_epochs = 0
-            v_loss_epochs = 0
-
-            for _ in range(self.k_epochs):
-                # Split into multiple batches of updates due to memory limitations
-                for i in range(int(num_batch)):
-                    if i + 1 < num_batch:
-                        start_idx = i * self.minibatch_size
-                        end_idx = (i + 1) * self.minibatch_size
-                    else:
-                        # the last batch
-                        start_idx = i * self.minibatch_size
-                        end_idx = full_batch_size
-                    if not obj_weight_input:
-                        pis, vals = self.policy(
-                            fea_j=t_data[0][start_idx:end_idx],
-                            op_mask=t_data[1][start_idx:end_idx],
-                            candidate=t_data[6][start_idx:end_idx],
-                            fea_m=t_data[2][start_idx:end_idx],
-                            mch_mask=t_data[3][start_idx:end_idx],
-                            comp_idx=t_data[5][start_idx:end_idx],
-                            dynamic_pair_mask=t_data[4][start_idx:end_idx],
-                            fea_pairs=t_data[7][start_idx:end_idx],
-                        )
-                    else:
-                        pis, vals = self.policy(
-                            fea_j=t_data[0][start_idx:end_idx],
-                            op_mask=t_data[1][start_idx:end_idx],
-                            candidate=t_data[6][start_idx:end_idx],
-                            fea_m=t_data[2][start_idx:end_idx],
-                            mch_mask=t_data[3][start_idx:end_idx],
-                            comp_idx=t_data[5][start_idx:end_idx],
-                            dynamic_pair_mask=t_data[4][start_idx:end_idx],
-                            fea_pairs=t_data[7][start_idx:end_idx],
-                            preferences=objective_weights.repeat_interleave(
-                                t_data[0].shape[0] // objective_weights.shape[0], dim=0
-                            )[start_idx:end_idx],
-                        )
-
-                    action_batch = t_data[8][start_idx:end_idx]
-                    action_batch = t_data[8][start_idx:end_idx]
-                    logprobs, ent_loss = eval_actions(pis, action_batch)
-                    ratios = torch.exp(
-                        logprobs - t_data[12][start_idx:end_idx].detach()
-                    )
-
-                    advantages = t_advantage_seq[start_idx:end_idx]
-                    surr1 = ratios * advantages
-                    surr2 = (
-                        torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip)
-                        * advantages
-                    )
-
-                    v_loss = self.V_loss_2(vals, v_target_seq[start_idx:end_idx])
-                    p_loss = -torch.min(surr1, surr2)
-                    ent_loss = -ent_loss.clone()
-                    loss = (
-                        self.vloss_coef * v_loss
-                        + self.ploss_coef * p_loss
-                        + self.entloss_coef * ent_loss
-                    )
-
-                    self.optimizer.zero_grad()
-                    loss_epochs += loss.mean().detach()
-                    v_loss_epochs += v_loss.mean().detach()
-                    loss.mean().backward()
-                    self.optimizer.step()
         else:
-            t_data = memory.transpose_data()
-
             t_advantage_seq, v_target_seq = memory.get_gae_advantages()
 
-            full_batch_size = len(t_data[-1])
-            num_batch = np.ceil(full_batch_size / self.minibatch_size)
+        expanded_preferences = None
+        if obj_weight_input:
+            expanded_preferences = objective_weights.repeat_interleave(
+                t_data[0].shape[0] // objective_weights.shape[0], dim=0
+            )
 
-            loss_epochs = 0
-            v_loss_epochs = 0
+        full_batch_size = len(t_data[-1])
+        num_batch = np.ceil(full_batch_size / self.minibatch_size)
 
-            for _ in range(self.k_epochs):
-                # Split into multiple batches of updates due to memory limitations
-                for i in range(int(num_batch)):
-                    if i + 1 < num_batch:
-                        start_idx = i * self.minibatch_size
-                        end_idx = (i + 1) * self.minibatch_size
-                    else:
-                        # the last batch
-                        start_idx = i * self.minibatch_size
-                        end_idx = full_batch_size
-                    if not obj_weight_input:
-                        pis, vals = self.policy(
-                            fea_j=t_data[0][start_idx:end_idx],
-                            op_mask=t_data[1][start_idx:end_idx],
-                            candidate=t_data[6][start_idx:end_idx],
-                            fea_m=t_data[2][start_idx:end_idx],
-                            mch_mask=t_data[3][start_idx:end_idx],
-                            comp_idx=t_data[5][start_idx:end_idx],
-                            dynamic_pair_mask=t_data[4][start_idx:end_idx],
-                            fea_pairs=t_data[7][start_idx:end_idx],
-                        )
-                    else:
-                        pis, vals = self.policy(
-                            fea_j=t_data[0][start_idx:end_idx],
-                            op_mask=t_data[1][start_idx:end_idx],
-                            candidate=t_data[6][start_idx:end_idx],
-                            fea_m=t_data[2][start_idx:end_idx],
-                            mch_mask=t_data[3][start_idx:end_idx],
-                            comp_idx=t_data[5][start_idx:end_idx],
-                            dynamic_pair_mask=t_data[4][start_idx:end_idx],
-                            fea_pairs=t_data[7][start_idx:end_idx],
-                            preferences=objective_weights.repeat_interleave(
-                                t_data[0].shape[0] // objective_weights.shape[0], dim=0
-                            )[start_idx:end_idx],
-                        )
+        loss_epochs = 0
+        v_loss_epochs = 0
 
-                    action_batch = t_data[8][start_idx:end_idx]
-                    logprobs, ent_loss = eval_actions(pis, action_batch)
-                    ratios = torch.exp(
-                        logprobs - t_data[12][start_idx:end_idx].detach()
-                    )
+        for _ in range(self.k_epochs):
+            permutation = torch.randperm(full_batch_size, device=t_data[0].device)
 
-                    advantages = t_advantage_seq[start_idx:end_idx]
-                    surr1 = ratios * advantages
-                    surr2 = (
-                        torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip)
-                        * advantages
-                    )
+            # Split into multiple batches of updates due to memory limitations
+            for i in range(int(num_batch)):
+                if i + 1 < num_batch:
+                    start_idx = i * self.minibatch_size
+                    end_idx = (i + 1) * self.minibatch_size
+                else:
+                    # the last batch
+                    start_idx = i * self.minibatch_size
+                    end_idx = full_batch_size
 
+                batch_indices = permutation[start_idx:end_idx]
+                policy_inputs = {
+                    "fea_j": t_data[0][batch_indices],
+                    "op_mask": t_data[1][batch_indices],
+                    "candidate": t_data[6][batch_indices],
+                    "fea_m": t_data[2][batch_indices],
+                    "mch_mask": t_data[3][batch_indices],
+                    "comp_idx": t_data[5][batch_indices],
+                    "dynamic_pair_mask": t_data[4][batch_indices],
+                    "fea_pairs": t_data[7][batch_indices],
+                }
+                if expanded_preferences is not None:
+                    policy_inputs["preferences"] = expanded_preferences[batch_indices]
+
+                pis, vals = self.policy(**policy_inputs)
+
+                action_batch = t_data[8][batch_indices]
+                logprobs, ent_loss = eval_actions(pis, action_batch)
+                ratios = torch.exp(logprobs - t_data[12][batch_indices].detach())
+
+                advantages = t_advantage_seq[batch_indices]
+                surr1 = ratios * advantages
+                surr2 = (
+                    torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip)
+                    * advantages
+                )
+
+                if obj_weight_input and not single_value_critic:
+                    v_loss = self.V_loss_2(vals, v_target_seq[batch_indices])
+                else:
                     v_loss = self.V_loss_2(
-                        vals.squeeze(1), v_target_seq[start_idx:end_idx]
+                        vals.squeeze(1), v_target_seq[batch_indices]
                     )
-                    p_loss = -torch.min(surr1, surr2)
-                    ent_loss = -ent_loss.clone()
-                    loss = (
-                        self.vloss_coef * v_loss
-                        + self.ploss_coef * p_loss
-                        + self.entloss_coef * ent_loss
-                    )
+                p_loss = -torch.min(surr1, surr2)
+                ent_loss = -ent_loss.clone()
+                loss = (
+                    self.vloss_coef * v_loss
+                    + self.ploss_coef * p_loss
+                    + self.entloss_coef * ent_loss
+                )
 
-                    self.optimizer.zero_grad()
-                    loss_epochs += loss.mean().detach()
-                    v_loss_epochs += v_loss.mean().detach()
-                    loss.mean().backward()
-                    self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss_epochs += loss.mean().detach()
+                v_loss_epochs += v_loss.mean().detach()
+                loss.mean().backward()
+                self._clip_gradients()
+                self.optimizer.step()
         # soft update
         for policy_old_params, policy_params in zip(
             self.policy_old.parameters(), self.policy.parameters()

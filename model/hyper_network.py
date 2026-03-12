@@ -93,6 +93,7 @@ class HyperActor(nn.Module):
         self.embd_dim = embd_dim
         self.instance_dim = instance_dim
         self.activative = torch.tanh
+        self.hyper_activation = nn.ReLU()
 
         if num_layers != 3:
             raise ValueError("HyperActor 目前仅支持 3 层！")
@@ -162,7 +163,9 @@ class HyperActor(nn.Module):
                 instance_features = instance_features.unsqueeze(0)
             h = h + self.instance_proj(instance_features)
 
-        mid_embd = self.hyper_fc3(self.hyper_fc2(h))
+        h = self.hyper_activation(h)
+        h = self.hyper_activation(self.hyper_fc2(h))
+        mid_embd = self.hyper_fc3(h)
         # mid_embd: [batch_size, embd_dim * 6]
 
         # 沿最后一维分割为 6 个大小为 embd_dim 的块

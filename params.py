@@ -117,6 +117,8 @@ parser.add_argument('--train_size', type=str, default="10x5", help='Size of trai
 parser.add_argument('--validate_timestep', type=int, default=40, help='Interval for validation and data log')
 parser.add_argument('--reset_env_timestep', type=int, default=20, help='Interval for reseting the environment')
 parser.add_argument('--minibatch_size', type=int, default=1024, help='Batch size for computing the gradient')
+parser.add_argument('--max_grad_norm', type=float, default=0.5,
+                    help='Maximum gradient norm for PPO updates; set <= 0 to disable clipping')
 
 # args for test
 parser.add_argument('--test_data', nargs='+', default=['20x10+mix'], help='List of data for testing')
