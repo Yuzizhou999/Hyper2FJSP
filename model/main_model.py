@@ -225,11 +225,6 @@ class DANIEL(nn.Module):
         return pi, v
 
 
-# HYPER_DANIEL is now maintained in its own file for easier modification.
-# Re-exported here for backward compatibility.
-from model.hyper_model import HYPER_DANIEL  # noqa: F401
-
-
 class MO_DANIEL_ENC_WEIGHT_INPUT(DANIEL):
     def __init__(self, config):
         """
@@ -891,3 +886,8 @@ class MODANIELConditionalOpAndMchFea_Input(nn.Module):
         global_feature = torch.cat((fea_j_global, fea_m_global), dim=-1)
         v = self.critic(global_feature)
         return pi, v
+
+
+# HYPER_DANIEL is maintained in its own file and re-exported here for
+# backward compatibility.
+from model.hyper_model import HYPER_DANIEL  # noqa: E402,F401

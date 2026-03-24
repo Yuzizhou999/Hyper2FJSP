@@ -56,6 +56,101 @@ class AttentionPooling(nn.Module):
         return torch.bmm(weights.unsqueeze(1), x).squeeze(1)  # [sz_b, d]
 
 
+class HyperEncoderConditioner(nn.Module):
+    """
+    Generate lightweight encoder-side conditioning signals from preferences.
+
+    The conditioner only produces FiLM parameters for raw encoder inputs and
+    preference embeddings consumed by the conditional attention encoder.
+    """
+
+    def __init__(
+        self,
+        pref_dim,
+        fea_j_input_dim,
+        fea_m_input_dim,
+        hyper_hidden_dim=256,
+        film_scale_limit=0.5,
+        film_shift_limit=0.5,
+    ):
+        super(HyperEncoderConditioner, self).__init__()
+        self.fea_j_input_dim = fea_j_input_dim
+        self.fea_m_input_dim = fea_m_input_dim
+        self.film_scale_limit = film_scale_limit
+        self.film_shift_limit = film_shift_limit
+        self.hyper_activation = nn.ReLU()
+
+        self.hyper_fc1 = nn.Linear(pref_dim, hyper_hidden_dim, bias=True)
+        self.hyper_fc2 = nn.Linear(hyper_hidden_dim, hyper_hidden_dim, bias=True)
+
+        self.j_gamma_head = nn.Linear(hyper_hidden_dim, fea_j_input_dim)
+        self.j_beta_head = nn.Linear(hyper_hidden_dim, fea_j_input_dim)
+        self.m_gamma_head = nn.Linear(hyper_hidden_dim, fea_m_input_dim)
+        self.m_beta_head = nn.Linear(hyper_hidden_dim, fea_m_input_dim)
+
+        self.pref_j_head = nn.Linear(hyper_hidden_dim, fea_j_input_dim)
+        self.pref_m_head = nn.Linear(hyper_hidden_dim, fea_m_input_dim)
+
+        self.cached_j_gamma = None
+        self.cached_j_beta = None
+        self.cached_m_gamma = None
+        self.cached_m_beta = None
+        self.cached_pref_j = None
+        self.cached_pref_m = None
+
+    def assign(self, pref):
+        if pref.dim() == 1:
+            pref = pref.unsqueeze(0)
+
+        h = self.hyper_activation(self.hyper_fc1(pref))
+        h = self.hyper_activation(self.hyper_fc2(h))
+
+        self.cached_j_gamma = 1.0 + self.film_scale_limit * torch.tanh(
+            self.j_gamma_head(h)
+        )
+        self.cached_j_beta = self.film_shift_limit * torch.tanh(self.j_beta_head(h))
+        self.cached_m_gamma = 1.0 + self.film_scale_limit * torch.tanh(
+            self.m_gamma_head(h)
+        )
+        self.cached_m_beta = self.film_shift_limit * torch.tanh(self.m_beta_head(h))
+        self.cached_pref_j = self.pref_j_head(h)
+        self.cached_pref_m = self.pref_m_head(h)
+        return pref.shape[0]
+
+    def _select(self, tensor, preference_indices):
+        return tensor if preference_indices is None else tensor[preference_indices]
+
+    def forward(self, fea_j, fea_m, preferences=None, preference_indices=None):
+        if preferences is not None:
+            self.assign(preferences)
+
+        if self.cached_j_gamma is None:
+            raise RuntimeError(
+                "Encoder conditioner parameters are not initialized. "
+                "Call assign(pref) first or pass preferences to forward()."
+            )
+
+        j_gamma = self._select(self.cached_j_gamma, preference_indices)
+        j_beta = self._select(self.cached_j_beta, preference_indices)
+        m_gamma = self._select(self.cached_m_gamma, preference_indices)
+        m_beta = self._select(self.cached_m_beta, preference_indices)
+        pref_j = self._select(self.cached_pref_j, preference_indices)
+        pref_m = self._select(self.cached_pref_m, preference_indices)
+
+        if fea_j.shape[0] != j_gamma.shape[0] or fea_m.shape[0] != m_gamma.shape[0]:
+            raise RuntimeError(
+                "Encoder conditioner batch size does not match feature batch size. "
+                "Use preference_indices when reusing cached preference parameters."
+            )
+
+        fea_j = fea_j * j_gamma.unsqueeze(1) + j_beta.unsqueeze(1)
+        fea_m = fea_m * m_gamma.unsqueeze(1) + m_beta.unsqueeze(1)
+        pref_j = pref_j.unsqueeze(1).expand(-1, fea_j.size(1), -1)
+        pref_m = pref_m.unsqueeze(1).expand(-1, fea_m.size(1), -1)
+
+        return fea_j, fea_m, pref_j, pref_m
+
+
 class HyperActor(nn.Module):
     """
     基于超网络的 Actor，通过偏好向量生成网络参数。

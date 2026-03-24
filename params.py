@@ -153,6 +153,12 @@ parser.add_argument('--hyper_embd_dim', type=int, default=2,
                     help='Embedding dimension for hypernetwork parameter generation (used with hyper_daniel architecture)')
 parser.add_argument('--hyper_use_instance_features', type=str2bool, default=False,
                     help='Whether HYPER conditions the hypernetwork on pooled instance features in addition to preferences')
+parser.add_argument('--hyper_condition_encoder', type=str2bool, default=False,
+                    help='Whether hyper_daniel also conditions the encoder, not just the actor')
+parser.add_argument('--hyper_encoder_use_film', type=str2bool, default=True,
+                    help='Whether hyper_daniel applies FiLM-style transforms to raw encoder inputs')
+parser.add_argument('--hyper_encoder_use_attention', type=str2bool, default=True,
+                    help='Whether hyper_daniel uses the conditional attention encoder with hyper-generated preference embeddings')
 
 
 parser.add_argument('--single_value_critic', type=str2bool, default=False, help='Whether to use a single value critic for PPO')

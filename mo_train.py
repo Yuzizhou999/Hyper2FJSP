@@ -161,6 +161,15 @@ class MOTrainer(train.Trainer):
                 if getattr(config, "hyper_use_instance_features", False)
                 else "_pref_only"
             )
+            if getattr(config, "hyper_condition_encoder", False):
+                encoder_bits = []
+                if getattr(config, "hyper_encoder_use_film", True):
+                    encoder_bits.append("film")
+                if getattr(config, "hyper_encoder_use_attention", True):
+                    encoder_bits.append("attn")
+                hyper_mode_suffix += "_enc_" + (
+                    "_".join(encoder_bits) if encoder_bits else "off"
+                )
 
         # Create the model name with the objective suffix
         self.model_name = f"{self.data_name}{strToSuffix(config.model_suffix)}_{config.model_architecture.value}{hyper_mode_suffix}{'_no_trans' if config.use_gamma_beta is False else ''}{'_large' if config.hidden_dim_actor > 65 else ''}{obj_suffix}{single_critic_suffix}{simple_reward_suffix}{no_lb_suffix}_MO"
