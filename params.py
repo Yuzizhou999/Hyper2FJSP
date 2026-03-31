@@ -138,7 +138,7 @@ parser.add_argument('--num_preferences_test', type=int, default=101, help='Numbe
 parser.add_argument(
     '--model_architecture',
     type=str,
-    default='mo_daniel_conditional',
+    default='mo_daniel_conditional_op_and_mch',
     help=(
         "Model architecture to use. Allowed values match ModelArchitecture enum: "
         "daniel, mo_daniel_enc_weight_input, mo_daniel_conditional_op_and_mch, "

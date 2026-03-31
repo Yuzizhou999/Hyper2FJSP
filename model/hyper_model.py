@@ -81,11 +81,12 @@ class HYPER_DANIEL(nn.Module):
         ).to(device)
 
     def assign_preferences(self, preferences):
-        self.current_preferences = preferences
-        if self.encoder_conditioner is not None:
-            self.encoder_conditioner.assign(preferences)
-        if not self.use_instance_features:
-            self.actor.assign(preferences)
+        self.current_preferences = preferences.detach()
+        with torch.no_grad():
+            if self.encoder_conditioner is not None:
+                self.encoder_conditioner.assign(self.current_preferences)
+            if not self.use_instance_features:
+                self.actor.assign(self.current_preferences)
 
     def _resolve_preferences(self, preferences, preference_indices):
         if preferences is not None:
