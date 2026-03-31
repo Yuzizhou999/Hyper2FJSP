@@ -58,10 +58,10 @@ class AttentionPooling(nn.Module):
 
 class HyperEncoderConditioner(nn.Module):
     """
-    Generate lightweight encoder-side conditioning signals from preferences.
+    基于偏好生成轻量级的编码器条件信号。
 
-    The conditioner only produces FiLM parameters for raw encoder inputs and
-    preference embeddings consumed by the conditional attention encoder.
+    该调节器仅为原始编码器输入生成 FiLM（特征线性调制）参数，
+    以及生成供条件注意力编码器使用的偏好嵌入。
     """
 
     def __init__(
@@ -91,6 +91,7 @@ class HyperEncoderConditioner(nn.Module):
         self.pref_j_head = nn.Linear(hyper_hidden_dim, fea_j_input_dim)
         self.pref_m_head = nn.Linear(hyper_hidden_dim, fea_m_input_dim)
 
+        # 用于缓存推断一次后的参数
         self.cached_j_gamma = None
         self.cached_j_beta = None
         self.cached_m_gamma = None
@@ -99,6 +100,7 @@ class HyperEncoderConditioner(nn.Module):
         self.cached_pref_m = None
 
     def assign(self, pref):
+        """预先计算一次并缓存从偏好到FiLM和编码器额外参数的生成结果"""
         if pref.dim() == 1:
             pref = pref.unsqueeze(0)
 
@@ -118,16 +120,20 @@ class HyperEncoderConditioner(nn.Module):
         return pref.shape[0]
 
     def _select(self, tensor, preference_indices):
+        """如果前向传播传入了索引用法，按索引取缓存，否则直接拿原缓存"""
         return tensor if preference_indices is None else tensor[preference_indices]
 
     def forward(self, fea_j, fea_m, preferences=None, preference_indices=None):
+        """
+        前向时将缓存在调节器里的仿射参数加在输入的 Job / Machine 初始特征上。
+        """
         if preferences is not None:
             self.assign(preferences)
 
         if self.cached_j_gamma is None:
             raise RuntimeError(
-                "Encoder conditioner parameters are not initialized. "
-                "Call assign(pref) first or pass preferences to forward()."
+                "编码器条件生成模块还未被初始化。"
+                "请先对其执行 assign(pref) 操作，或者直接传 preferences 进来！"
             )
 
         j_gamma = self._select(self.cached_j_gamma, preference_indices)
@@ -139,8 +145,8 @@ class HyperEncoderConditioner(nn.Module):
 
         if fea_j.shape[0] != j_gamma.shape[0] or fea_m.shape[0] != m_gamma.shape[0]:
             raise RuntimeError(
-                "Encoder conditioner batch size does not match feature batch size. "
-                "Use preference_indices when reusing cached preference parameters."
+                "编码器条件模块的 Batch Size 与特征输入的 Batch Size 不匹配。"
+                "在重用缓存分配的偏好时可以使用 preference_indices 进行正确映射。"
             )
 
         fea_j = fea_j * j_gamma.unsqueeze(1) + j_beta.unsqueeze(1)
@@ -149,6 +155,120 @@ class HyperEncoderConditioner(nn.Module):
         pref_m = pref_m.unsqueeze(1).expand(-1, fea_m.size(1), -1)
 
         return fea_j, fea_m, pref_j, pref_m
+
+
+class EventHyperAdapter(nn.Module):
+    """
+    为 HyperActor 的参数生成基于事件条件的残差（补偿信号）。
+    在动态调度环境下，根据事件上下文（Event Context）动态调整已经由偏好生成的Actor网络参数。
+    """
+
+    def __init__(
+        self,
+        event_dim,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        adapter_hidden_dim=128,
+        delta_scale=0.1,
+    ):
+        """
+        初始化事件超网络适配器。
+        
+        :param event_dim: 事件上下文特征向量的维度
+        :param input_dim: Actor网络的输入维度
+        :param hidden_dim: Actor网络的隐藏层维度
+        :param output_dim: Actor网络的输出维度
+        :param adapter_hidden_dim: 适配器内部MLP的隐藏层维度
+        :param delta_scale: 放缩因子，用于控制残差更新的幅度
+        """
+        super(EventHyperAdapter, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.delta_scale = delta_scale
+
+        total_delta_dim = (
+            hidden_dim * input_dim
+            + hidden_dim
+            + hidden_dim * hidden_dim
+            + hidden_dim
+            + output_dim * hidden_dim
+            + output_dim
+        )
+
+        self.fc1 = nn.Linear(event_dim, adapter_hidden_dim)
+        self.fc2 = nn.Linear(adapter_hidden_dim, adapter_hidden_dim)
+        self.fc_out = nn.Linear(adapter_hidden_dim, total_delta_dim)
+        self.gate = nn.Linear(adapter_hidden_dim, 1)
+        self.activation = nn.ReLU()
+
+    def forward(self, event_context):
+        """
+        前向传播生成因事件而异的网络残差。
+        
+        :param event_context: 描述当前动态调度事件上下文的特征向量
+        :return: 包含 3 层网络参数偏移量(delta)的字典
+        """
+        if event_context.dim() == 1:
+            event_context = event_context.unsqueeze(0)
+
+        # 1. 对上下文进行非线性特征化
+        h = self.activation(self.fc1(event_context))
+        h = self.activation(self.fc2(h))
+        
+        # 2. 计算门控值控制偏移影响
+        gate = torch.sigmoid(self.gate(h))
+        
+        # 3. 计算最终的放缩残差张量
+        delta = self.delta_scale * torch.tanh(self.fc_out(h)) * gate
+
+        batch_size = event_context.shape[0]
+        cursor = 0
+
+        # 分配第 1 层参数
+        lin1_size = self.hidden_dim * self.input_dim
+        bias1_size = self.hidden_dim
+        # 分配第 2 层参数
+        lin2_size = self.hidden_dim * self.hidden_dim
+        bias2_size = self.hidden_dim
+        # 分配第 3 层参数
+        lin3_size = self.output_dim * self.hidden_dim
+        bias3_size = self.output_dim
+
+        # 4. 根据相应结构的尺寸拆分并重塑 (resaphe) 为适配的权重矩阵格式
+        lin1_delta = delta[:, cursor : cursor + lin1_size].reshape(
+            batch_size, self.hidden_dim, self.input_dim
+        )
+        cursor += lin1_size
+        bias1_delta = delta[:, cursor : cursor + bias1_size].reshape(
+            batch_size, self.hidden_dim
+        )
+        cursor += bias1_size
+        lin2_delta = delta[:, cursor : cursor + lin2_size].reshape(
+            batch_size, self.hidden_dim, self.hidden_dim
+        )
+        cursor += lin2_size
+        bias2_delta = delta[:, cursor : cursor + bias2_size].reshape(
+            batch_size, self.hidden_dim
+        )
+        cursor += bias2_size
+        lin3_delta = delta[:, cursor : cursor + lin3_size].reshape(
+            batch_size, self.output_dim, self.hidden_dim
+        )
+        cursor += lin3_size
+        bias3_delta = delta[:, cursor : cursor + bias3_size].reshape(
+            batch_size, self.output_dim
+        )
+
+        return {
+            "dec_lin1_delta": lin1_delta,
+            "dec_bias1_delta": bias1_delta,
+            "dec_lin2_delta": lin2_delta,
+            "dec_bias2_delta": bias2_delta,
+            "dec_lin3_delta": lin3_delta,
+            "dec_bias3_delta": bias3_delta,
+        }
 
 
 class HyperActor(nn.Module):
@@ -293,7 +413,18 @@ class HyperActor(nn.Module):
 
         return batch_size
 
-    def forward(self, x, preferences=None, preference_indices=None):
+    def forward(
+        self,
+        x,
+        preferences=None,
+        preference_indices=None,
+        dec_lin1_delta=None,
+        dec_bias1_delta=None,
+        dec_lin2_delta=None,
+        dec_bias2_delta=None,
+        dec_lin3_delta=None,
+        dec_bias3_delta=None,
+    ):
         """
         使用生成的参数进行前向传播。
         批次中的每个样本使用其对应的生成参数。
@@ -344,6 +475,19 @@ class HyperActor(nn.Module):
         # x: [batch_size, seq_len, input_dim]
         # lin1_para: [batch_size, hidden_dim, input_dim]
         # 需要: [batch_size, seq_len, input_dim] @ [batch_size, input_dim, hidden_dim]
+
+        if dec_lin1_delta is not None:
+            lin1_para = lin1_para + dec_lin1_delta
+        if dec_bias1_delta is not None:
+            bias1_para = bias1_para + dec_bias1_delta
+        if dec_lin2_delta is not None:
+            lin2_para = lin2_para + dec_lin2_delta
+        if dec_bias2_delta is not None:
+            bias2_para = bias2_para + dec_bias2_delta
+        if dec_lin3_delta is not None:
+            lin3_para = lin3_para + dec_lin3_delta
+        if dec_bias3_delta is not None:
+            bias3_para = bias3_para + dec_bias3_delta
 
         h = torch.bmm(x, lin1_para.transpose(1, 2))  # [batch_size, seq_len, hidden_dim]
         h = h + bias1_para.unsqueeze(1)  # 加偏置: [batch_size, 1, hidden_dim]

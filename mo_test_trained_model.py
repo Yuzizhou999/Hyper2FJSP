@@ -34,14 +34,13 @@ test_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
 
 def save_pareto_sets(pareto_sets, data_source, data_name, model_name, strategy):
     """
-    Save Pareto sets to disk
+    将生成的帕累托前沿集合（Pareto Sets）保存到本地磁盘。
 
-    Args:
-        pareto_sets: List of Pareto sets for each instance
-        data_source: Source of the data (e.g., 'SD1', 'SD2')
-        data_name: Name of the dataset
-        model_name: Name of the model
-        strategy: Strategy used ('greedy' or 'sampling')
+    :param pareto_sets: 每个测试用例计算得出的帕累托解集组成的列表
+    :param data_source: 数据分布来源 (例如 'SD1', 'SD2', 'JSSP')
+    :param data_name: 使用的数据集的具体名字 (例 '10x5')
+    :param model_name: 被测试的模型名字
+    :param strategy: 所用的推理策略（'greedy'，即贪婪模式，或其他采样策略）
     """
     save_dir = f"./pareto_sets/{data_source}/{data_name}/{model_name}_{strategy}"
 
@@ -69,13 +68,13 @@ def save_preference_response(
     instance_index,
 ):
     """
-    Save preference-conditioned objective values for one test instance.
+    保存一个测试实例下，偏好向量与其对应的客观评价值的响应关系。
+    这用于后续分析超网络对不同倾向(权重)设定是否具备有效并准确的方向响应能力。
 
-    Args:
-        preferences: Preference vectors with shape [num_points, pref_dim]
-        objectives: Objective vectors with shape [num_points, num_objectives]
-        pareto_mask: Boolean mask of nondominated solutions
-        objective_names: Ordered objective names matching the columns in objectives
+    :param preferences: 形状为 [num_points, pref_dim] 的偏好向量记录
+    :param objectives: 基于偏好决策实际产生的解目标阵列 [num_points, num_objectives]
+    :param pareto_mask: 布尔掩码标注哪些结果解落在了帕累托非支配前沿上
+    :param objective_names: 目标名称（按列排列一致）
     """
     save_dir = f"./preference_responses/{data_source}/{data_name}/{model_name}_{strategy}"
     if not os.path.exists(save_dir):
@@ -92,6 +91,16 @@ def save_preference_response(
 
 
 def collect_eval_objectives(env, objective_fn, cost_reference_index=None):
+    """
+    工具方法：汇总验证环境测试跑完后，所获得的各个目标评级的真实值并映射相关归一化引用的索引。
+    
+    :return: 
+      - eval_objectives: 收集完成的目标多轴值矩阵
+      - reference_point_indices: 具体目标在参考基准点数组中的列排布索引
+      - lb_indices: Lower-bound特征索引
+      - normalization_values: 映射用于后续参考点正态化的基准索引
+      - objective_names: 各被采纳目标的字符串英文缩写名称组成的列表
+    """
     eval_objectives = []
     reference_point_indices = []
     lb_indices = []
@@ -158,39 +167,67 @@ def test_greedy_strategy(
     num_preferences=101,
 ):
     """
-        test the model on the given data using the greedy strategy
-    :param data_set: test data
-    :param model_path: the path of the model file
-    :param seed: the seed for testing
-    :return: the test results including the makespan and time
+    使用贪婪策略（Greedy Strategy）在提供的测试数据集上测试并评估训练好的超网络强化模型。反向使用推断所得的目标解求取前沿。
+
+    :param data_set: 测试用的数据集 (包含工件与工序时长等矩阵)
+    :param model_path: 已保存的 PyTorch 模型文件路径
+    :param seed: 随机种子，用于复现固定环境
+    :param objective_fn: 对应环境与评价要使用的目标集合
+    :param reference_points: HV或性能计算里用于比较归一化上限的参考点信息
+    :param model_name: 模型日志名称
+    :param data_source: 验证数据分布名 (比如 JSSP, SD1, SD2)
+    :param data_name: 数据子集名 (比如 '15x15')
+    :param num_preferences: 偏好的划分密度/离散个数（默认为两个目标的 101 等分）
+    :return: 包含各种评估指标均值方差的性能字典 performance_metrics 
     """
 
     test_result_list = []
 
     setup_seed(seed)
+    # 重载 PPO 里的Actor/Critic参数用于前向
     ppo.policy.load_state_dict(torch.load(model_path, map_location=device))
     ppo.policy.eval()
 
     # Detect use_lb_features from model name
     use_lb_features = "_NoLB" not in model_name if model_name else True
 
+    # 实例维度还原
     n_j = data_set[0][0].shape[0]
     n_op, n_m = data_set[1][0].shape
+    
+    # 构建兼容多目标推断与各类随机事件开启的 FJSP 环境
     env = MOFJSPEnvForSameOpNums(
         n_j=n_j,
         n_m=n_m,
         objective_fns=objective_fn,
         data_source=data_source,
         use_lb_features=use_lb_features,
+        dynamic_events_enabled=getattr(configs, "dynamic_events_enabled", False),
+        dynamic_event_prob=getattr(configs, "dynamic_event_prob", 0.0),
+        dynamic_event_types=getattr(
+            configs,
+            "dynamic_event_types",
+            ["job_arrival", "machine_breakdown", "deadline_shift", "energy_spike"],
+        ),
+        dynamic_breakdown_duration=getattr(configs, "dynamic_breakdown_duration", 2),
+        dynamic_deadline_shift_scale=getattr(
+            configs, "dynamic_deadline_shift_scale", 0.1
+        ),
+        dynamic_energy_duration=getattr(configs, "dynamic_energy_duration", 2),
+        dynamic_energy_scale=getattr(configs, "dynamic_energy_scale", 0.2),
+        dynamic_seed=getattr(configs, "seed_test", None),
     )
 
     performance_metrics = defaultdict(list)
 
+    # =============== 初始化用于多目标的评价散点偏好 ===============
     if len(objective_fn) == 2:
+        # 两目标直接均匀切分
         preferences = np.linspace(0, 1, num_preferences)
         preferences = np.array([preferences, 1 - preferences]).T
         preferences = torch.from_numpy(preferences).float().to(device)
     elif len(objective_fn) == 3:
+        # 三目标使用 das_dennis 对三角流形内采样
         if num_preferences == 105:
             preferences = das_dennis(13, 3)  # 105
         elif num_preferences == 496:
@@ -209,6 +246,7 @@ def test_greedy_strategy(
 
         preferences = torch.from_numpy(preferences).float().to(device)
     elif len(objective_fn) == 4:
+        # 四目标类似采样
         if num_preferences == 84:
             preferences = das_dennis(6, 4)  # 84
         elif num_preferences == 120:
@@ -227,24 +265,27 @@ def test_greedy_strategy(
 
         preferences = torch.from_numpy(preferences).float().to(device)
     else:
-        raise NotImplementedError("Unsupported number of objectives.")
+        raise NotImplementedError("目前不支持大于四个目标的偏好矩阵采样模式。")
+        
     preferences_np = preferences.detach().cpu().numpy()
     original_data_set_size = len(data_set[0])
+    
+    # 数据增强：使用复制的方式，让每一个 Batch Size (101个解) 处理的都是同一个拓扑不同的偏好
     data_set = (
-        # list(np.repeat(data_set[0], num_preferences, axis=0))
         [i for i in data_set[0] for _ in range(num_preferences)],
         [i for i in data_set[1] for _ in range(num_preferences)],
     )
 
     pareto_sets = []
 
-    # For HYPER_DANIEL: generate parameters once for all unique preferences
+    # ============== 对于搭载超网络的架构预分配权重 ==============
     if hasattr(ppo.policy, "assign_preferences"):
         ppo.policy.assign_preferences(preferences)
         prefs_to_pass = None
     else:
         prefs_to_pass = preferences
 
+    # ============== 进行针对各个样本的具体贪婪推断遍历 ==============
     for i in tqdm(
         range(original_data_set_size), file=sys.stdout, desc="progress", colour="blue"
     ):
@@ -255,19 +296,31 @@ def test_greedy_strategy(
         )
         t1 = time.time()
         while True:
+            # PPO Actor 的评分提取
             with torch.no_grad():
-                pi, _ = ppo.policy(
-                    fea_j=state.fea_j_tensor,  # [num_preferences, N, 8]
-                    op_mask=state.op_mask_tensor,  # [num_preferences, N, N]
-                    candidate=state.candidate_tensor,  # [num_preferences, J]
-                    fea_m=state.fea_m_tensor,  # [num_preferences, M, 6]
-                    mch_mask=state.mch_mask_tensor,  # [num_preferences, M, M]
-                    comp_idx=state.comp_idx_tensor,  # [num_preferences, M, M, J]
-                    dynamic_pair_mask=state.dynamic_pair_mask_tensor,
-                    fea_pairs=state.fea_pairs_tensor,
-                    preferences=prefs_to_pass,  # None for HYPER_DANIEL, preferences for others
-                )  # [num_preferences, J, M]
+                policy_kwargs = {
+                    "fea_j": state.fea_j_tensor,  # [num_preferences, N, 8]
+                    "op_mask": state.op_mask_tensor,  # [num_preferences, N, N]
+                    "candidate": state.candidate_tensor,  # [num_preferences, J]
+                    "fea_m": state.fea_m_tensor,  # [num_preferences, M, 6]
+                    "mch_mask": state.mch_mask_tensor,  # [num_preferences, M, M]
+                    "comp_idx": state.comp_idx_tensor,  # [num_preferences, M, M, J]
+                    "dynamic_pair_mask": state.dynamic_pair_mask_tensor,
+                    "fea_pairs": state.fea_pairs_tensor,
+                    "preferences": prefs_to_pass,  # none 给超网络, preferences 给基模
+                }
+                
+                # 若开启事件环境响应网络
+                if (
+                    hasattr(ppo.policy, "supports_event_context")
+                    and ppo.policy.supports_event_context
+                ):
+                    policy_kwargs["event_context"] = state.event_context_tensor
+                    
+                # [num_preferences, J, M] : 各组合偏好对应的调度策略概率分布
+                pi, _ = ppo.policy(**policy_kwargs)  
 
+            # 根据贪心策略选择分布中概率最大的合法动作为最终采取的动作
             action = greedy_select_action(pi)
             state, reward, done = env.step(actions=action.cpu().numpy())
             if done.all():
@@ -357,6 +410,20 @@ def test_sampling_strategy(
         objective_fns=objective_fn,
         data_source=data_source,
         use_lb_features=use_lb_features,
+        dynamic_events_enabled=getattr(configs, "dynamic_events_enabled", False),
+        dynamic_event_prob=getattr(configs, "dynamic_event_prob", 0.0),
+        dynamic_event_types=getattr(
+            configs,
+            "dynamic_event_types",
+            ["job_arrival", "machine_breakdown", "deadline_shift", "energy_spike"],
+        ),
+        dynamic_breakdown_duration=getattr(configs, "dynamic_breakdown_duration", 2),
+        dynamic_deadline_shift_scale=getattr(
+            configs, "dynamic_deadline_shift_scale", 0.1
+        ),
+        dynamic_energy_duration=getattr(configs, "dynamic_energy_duration", 2),
+        dynamic_energy_scale=getattr(configs, "dynamic_energy_scale", 0.2),
+        dynamic_seed=getattr(configs, "seed_test", None),
     )
 
     performance_metrics = defaultdict(list)
@@ -422,31 +489,31 @@ def test_sampling_strategy(
         [i for i in data_set[1] for _ in range(num_preferences * sample_times)],
     )
 
-    # For HYPER_DANIEL: generate parameters once for all unique preferences
-    # Note: preferences tensor is repeated sample_times, but we only need unique ones
-    # preferences.repeat(sample_times, axis=0) creates: [p0,p0,...,p0, p1,p1,...,p1, ...]
-    # So we need to extract every sample_times-th element to get unique preferences
+    # 对于搭载 HYPER_DANIEL 超网络的架构：仅对所有唯一的偏好点生成一次参数即可
+    # 注意：preferences 张量会根据采样次数 repeat 多次，但我们只抽取独一无二的值
+    # preferences.repeat(sample_times, axis=0) 会创建: [p0,p0,...,p0, p1,p1,...,p1, ...]
+    # 所以我们需要按 sample_times 的步长提取出唯一的偏好值
     if hasattr(ppo.policy, "assign_preferences"):
-        # Extract unique preferences by taking every sample_times-th element
+        # 沿 0 维以 sample_times 步长提取，获取所有独立的偏好值
         unique_preferences = preferences[
             ::sample_times
-        ]  # Takes indices 0, sample_times, 2*sample_times, ...
+        ]  # 抽取索引 0, sample_times, 2*sample_times, ...
         ppo.policy.assign_preferences(unique_preferences)
         use_preference_indices = True
     else:
         use_preference_indices = False
 
-    # Process each instance with all cycles before moving to next instance
+    # 在处理下一个算例之前，完成属于该算例所有周期的采样过程
     for i in tqdm(
         range(original_data_set_size),
         file=sys.stdout,
         desc="Instance progress",
         colour="blue",
     ):
-        # Accumulate solutions across all cycles for this instance
-        accumulated_solutions = []  # Store all solutions from all cycles
+        # 累积当前算例在所有采样周期的求解结果
+        accumulated_solutions = []  # 存放所有周期的所有解
 
-        # Run multiple sampling cycles for this instance
+        # 对当前算例执行多周期的多次采样寻优
         for cycle in range(num_sampling_cycles):
             if num_sampling_cycles > 1:
                 print(
@@ -478,30 +545,42 @@ def test_sampling_strategy(
                             torch.arange(num_envs, device=device) // sample_times
                         )
 
-                        pi, _ = ppo.policy(
-                            fea_j=state.fea_j_tensor,
-                            op_mask=state.op_mask_tensor,
-                            candidate=state.candidate_tensor,
-                            fea_m=state.fea_m_tensor,
-                            mch_mask=state.mch_mask_tensor,
-                            comp_idx=state.comp_idx_tensor,
-                            dynamic_pair_mask=state.dynamic_pair_mask_tensor,
-                            fea_pairs=state.fea_pairs_tensor,
-                            preferences=None,  # Already assigned
-                            preference_indices=pref_indices,
-                        )
+                        policy_kwargs = {
+                            "fea_j": state.fea_j_tensor,
+                            "op_mask": state.op_mask_tensor,
+                            "candidate": state.candidate_tensor,
+                            "fea_m": state.fea_m_tensor,
+                            "mch_mask": state.mch_mask_tensor,
+                            "comp_idx": state.comp_idx_tensor,
+                            "dynamic_pair_mask": state.dynamic_pair_mask_tensor,
+                            "fea_pairs": state.fea_pairs_tensor,
+                            "preferences": None,  # Already assigned
+                            "preference_indices": pref_indices,
+                        }
+                        if (
+                            hasattr(ppo.policy, "supports_event_context")
+                            and ppo.policy.supports_event_context
+                        ):
+                            policy_kwargs["event_context"] = state.event_context_tensor
+                        pi, _ = ppo.policy(**policy_kwargs)
                     else:
-                        pi, _ = ppo.policy(
-                            fea_j=state.fea_j_tensor,  # [num_preferences * sample_times, N, 8]
-                            op_mask=state.op_mask_tensor,
-                            candidate=state.candidate_tensor,
-                            fea_m=state.fea_m_tensor,
-                            mch_mask=state.mch_mask_tensor,
-                            comp_idx=state.comp_idx_tensor,
-                            dynamic_pair_mask=state.dynamic_pair_mask_tensor,
-                            fea_pairs=state.fea_pairs_tensor,
-                            preferences=preferences,
-                        )
+                        policy_kwargs = {
+                            "fea_j": state.fea_j_tensor,  # [num_preferences * sample_times, N, 8]
+                            "op_mask": state.op_mask_tensor,
+                            "candidate": state.candidate_tensor,
+                            "fea_m": state.fea_m_tensor,
+                            "mch_mask": state.mch_mask_tensor,
+                            "comp_idx": state.comp_idx_tensor,
+                            "dynamic_pair_mask": state.dynamic_pair_mask_tensor,
+                            "fea_pairs": state.fea_pairs_tensor,
+                            "preferences": preferences,
+                        }
+                        if (
+                            hasattr(ppo.policy, "supports_event_context")
+                            and ppo.policy.supports_event_context
+                        ):
+                            policy_kwargs["event_context"] = state.event_context_tensor
+                        pi, _ = ppo.policy(**policy_kwargs)
 
                 action, _ = sample_action(pi)
                 state, reward, done = env.step(actions=action.cpu().numpy())
@@ -520,13 +599,13 @@ def test_sampling_strategy(
 
             eval_objectives = eval_objectives.reshape(num_preferences * sample_times, -1)
 
-            # Add solutions from this cycle to accumulated solutions
+            # 把本周期的解添加到累积集合中
             accumulated_solutions.append(eval_objectives)
 
-            # Combine all solutions from all cycles so far
+            # 沿纵向拼接合并迄今为止获得的所有解
             all_solutions_so_far = np.vstack(
                 accumulated_solutions
-            )  # Shape: [total_solutions_so_far, num_objectives]
+            )  # 形状: [目前为止的总解数量, 目标维度]
             all_preferences_so_far = np.tile(preferences_np, (cycle + 1, 1))
 
             print(
@@ -535,13 +614,13 @@ def test_sampling_strategy(
                 f"Unique: {len(np.unique(all_solutions_so_far, axis=0))}"
             )
 
-            # Compute Pareto set from all accumulated solutions
+            # 根据所有累积起来的解计算最终的帕累托前沿集合
             pareto_set = find_pareto_efficient_solutions(all_solutions_so_far)
             pareto_mask = is_pareto_efficient(all_solutions_so_far)
             print(f"Accumulated Pareto set size: {len(pareto_set)}")
 
-            # Compute hypervolume of accumulated Pareto set
-            # Reorder lower bounds to match the order of objectives using lb_indices
+            # 根据累积的帕累托前沿求解超体积
+            # 重新排序各维度的下界基准线以匹配验证集的观测指标顺序
             all_lower_bounds = env.objective_lower_bounds[0]
             lower_bounds = all_lower_bounds[lb_indices]
             normalized_hypervolume = compute_hypervolume(
@@ -556,26 +635,26 @@ def test_sampling_strategy(
                 [normalized_hypervolume, num_solutions_in_pareto_set, t2 - t1]
             )
 
-            # Store results for this instance and cycle
+            # 保存当前算例于本周期的结果数据
             all_cycles_pareto_sets.append(pareto_set)
             all_cycles_performance_metrics.append(performance_metrics)
 
-            # Save the accumulated Pareto set for this instance and cycle
+            # 如果存在文件指向信息，则保存此周期针对该算例累积出来的帕累托集合
             if model_name and data_source and data_name:
-                # Extract data from masked array if needed
+                # 若使用了 masked_array 取决于类型可萃取其中 data
                 pareto_set_data = (
                     pareto_set.data if hasattr(pareto_set, "data") else pareto_set
                 )
 
                 if num_sampling_cycles > 1:
-                    # Save with cycle number in the path
+                    # 在保存路径中插入当前周期序号
                     save_dir = f"./pareto_sets/{data_source}/{data_name}/{model_name}_sampling_cycle{cycle + 1}"
                     if not os.path.exists(save_dir):
                         os.makedirs(save_dir)
                     save_path = f"{save_dir}/instance_{i}.npy"
                     np.save(save_path, pareto_set_data)
                 else:
-                    # Original behavior for single cycle
+                    # 仅具有一轮采样循环的原有保存处理逻辑
                     save_dir = (
                         f"./pareto_sets/{data_source}/{data_name}/{model_name}_sampling"
                     )
@@ -603,15 +682,15 @@ def test_sampling_strategy(
 
 def main(config, flag_sample):
     """
-        test the trained model following the config and save the results
-    :param flag_sample: whether using the sampling strategy
+        据配置文件读取经过训练的模型，验证并保存测试结果
+    :param flag_sample: 是否使用采样探索策略（而非贪婪推断）
     """
     setup_seed(config.seed_test)
     objective_fn = [ObjectiveFn(str(obj_fn).lower()) for obj_fn in config.objective_fn]
     if not os.path.exists("./test_results"):
         os.makedirs("./test_results")
 
-    # collect the path of test models
+    # 汇集需要验证测试的模型路径
     test_model = []
 
     for model_name in config.test_model:
@@ -619,7 +698,7 @@ def main(config, flag_sample):
             (f"./trained_network/{config.model_source}/{model_name}.pth", model_name)
         )
 
-    # collect the test data
+    # 读取提取所有需要测试的验证数据
     test_data, test_reference_points = pack_data_from_config(
         config.data_source, config.test_data, load_reference_points=True
     )
@@ -636,7 +715,7 @@ def main(config, flag_sample):
             test_reference_points[0][1],
         )
 
-    # Determine test mode
+    # 确认测试模式决定模型的前缀名称
     if flag_sample:
         model_prefix = "DANIELS"
     else:
@@ -659,7 +738,7 @@ def main(config, flag_sample):
                 if not flag_sample:
                     print("Test mode: Greedy")
                     result_5_times = []
-                    # Greedy mode, test 5 times, record average time.
+                    # 贪婪推理模式，共测试1次（若曾设定为多次可求平减小误差），记录推断耗时。
                     for j in range(1):
                         result, performance_metrics = test_greedy_strategy(
                             data[0],
@@ -677,18 +756,18 @@ def main(config, flag_sample):
                     result_5_times = np.array(result_5_times)
 
                     save_result = np.mean(result_5_times, axis=0)
-                    print("testing results:")
-                    print("Objective value (greedy): ", save_result[:, 0].mean())
-                    print("Num solutions in pareto set: ", save_result[:, 1].mean())
+                    print("测试输出结果:")
+                    print("目标值 (Greedy 贪婪模式): ", save_result[:, 0].mean())
+                    print("位于帕累托非支配集内的解个数: ", save_result[:, 1].mean())
                     print(
-                        f"Performance metrics: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
+                        f"性能评测指标: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
                     )
-                    print("time: ", save_result[:, 2].mean())
+                    print("耗时: ", save_result[:, 2].mean())
 
                 else:
                     print("Test mode: Sampling")
                     result_5_times = []
-                    # Sampling mode, test 5 times, record average time.
+                    # 采样模式，测试运行并记录耗费时间。
                     for j in range(1):
                         result, performance_metrics = test_sampling_strategy(
                             data[0],
@@ -707,13 +786,13 @@ def main(config, flag_sample):
                     result_5_times = np.array(result_5_times)
 
                     save_result = np.mean(result_5_times, axis=0)
-                    print("testing results:")
-                    print("Objective value (sampling): ", save_result[:, 0].mean())
-                    print("Num solutions in pareto set: ", save_result[:, 1].mean())
+                    print("测试输出结果:")
+                    print("目标值 (Sampling 采样模式): ", save_result[:, 0].mean())
+                    print("位于帕累托非支配集内的解个数: ", save_result[:, 1].mean())
                     print(
-                        f"Performance metrics: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
+                        f"性能评测指标: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
                     )
-                    print("time: ", save_result[:, 2].mean())
+                    print("耗时: ", save_result[:, 2].mean())
 
 
 if __name__ == "__main__":

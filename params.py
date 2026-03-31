@@ -160,6 +160,30 @@ parser.add_argument('--hyper_encoder_use_film', type=str2bool, default=True,
 parser.add_argument('--hyper_encoder_use_attention', type=str2bool, default=True,
                     help='Whether hyper_daniel uses the conditional attention encoder with hyper-generated preference embeddings')
 
+# Event-aware lower-level hypernetwork parameters
+parser.add_argument('--hyper_event_adapter_enabled', type=str2bool, default=False,
+                    help='Whether hyper_daniel uses an event-conditioned lower-level hypernetwork adapter')
+parser.add_argument('--hyper_event_hidden_dim', type=int, default=128,
+                    help='Hidden dimension for event hypernetwork adapter')
+parser.add_argument('--hyper_event_delta_scale', type=float, default=0.1,
+                    help='Max magnitude scale for event-induced actor parameter residuals')
+
+# Dynamic-event environment parameters
+parser.add_argument('--dynamic_events_enabled', type=str2bool, default=False,
+                    help='Enable stochastic dynamic events during rollout')
+parser.add_argument('--dynamic_event_prob', type=float, default=0.0,
+                    help='Per-step trigger probability for each enabled event family')
+parser.add_argument('--dynamic_event_types', nargs='+',
+                    default=['job_arrival', 'machine_breakdown', 'deadline_shift', 'energy_spike'],
+                    help='Enabled dynamic event families')
+parser.add_argument('--dynamic_breakdown_duration', type=int, default=2,
+                    help='Duration (steps) for machine breakdown events')
+parser.add_argument('--dynamic_deadline_shift_scale', type=float, default=0.1,
+                    help='Max relative scale for stochastic deadline shifts')
+parser.add_argument('--dynamic_energy_duration', type=int, default=2,
+                    help='Duration (steps) for machine energy spike events')
+parser.add_argument('--dynamic_energy_scale', type=float, default=0.2,
+                    help='Max relative scale for machine energy multipliers')
 
 parser.add_argument('--single_value_critic', type=str2bool, default=False, help='Whether to use a single value critic for PPO')
 parser.add_argument('--use_simple_reward', type=str2bool, default=False,

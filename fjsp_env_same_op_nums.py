@@ -24,6 +24,8 @@ class EnvState:
     comp_idx_tensor = torch.empty(0)
     candidate_tensor = torch.empty(0)
     fea_pairs_tensor = torch.empty(0)
+    event_context_tensor = torch.empty(0)
+    event_mch_tensor = torch.empty(0)
 
     device: torch.device = torch.device(configs.device)
 
@@ -37,6 +39,8 @@ class EnvState:
         comp_idx: np.ndarray,
         candidate: np.ndarray,
         fea_pairs: np.ndarray,
+        event_context: np.ndarray | None = None,
+        event_mch: np.ndarray | None = None,
     ) -> None:
         """
             update the state information
@@ -66,6 +70,22 @@ class EnvState:
         self.dynamic_pair_mask_tensor = torch.from_numpy(np.copy(dynamic_pair_mask)).to(
             device
         )
+        if event_context is None:
+            self.event_context_tensor = torch.empty((fea_j.shape[0], 0)).float().to(
+                device
+            )
+        else:
+            self.event_context_tensor = (
+                torch.from_numpy(np.copy(event_context)).float().to(device)
+            )
+        if event_mch is None:
+            self.event_mch_tensor = torch.empty((fea_j.shape[0], 0, 0)).float().to(
+                device
+            )
+        else:
+            self.event_mch_tensor = torch.from_numpy(np.copy(event_mch)).float().to(
+                device
+            )
 
     def print_shape(self) -> None:
         print(self.fea_j_tensor.shape)

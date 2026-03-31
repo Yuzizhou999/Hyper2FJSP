@@ -1,5 +1,8 @@
+import copy
 import numpy as np
+import numpy.ma as ma
 
+from dynamic_event_engine import DynamicEventEngine
 from enums import ObjectiveFn
 from fjsp_env_various_op_nums import EnvState, FJSPEnvForVariousOpNums
 from multipliers import MULTIPLIERS
@@ -14,6 +17,14 @@ class MOFJSPEnvForVariousOpNums(FJSPEnvForVariousOpNums):
         data_source: str,
         use_simple_reward: bool = False,
         use_lb_features: bool = True,
+        dynamic_events_enabled: bool = False,
+        dynamic_event_prob: float = 0.0,
+        dynamic_event_types: list[str] | None = None,
+        dynamic_breakdown_duration: int = 2,
+        dynamic_deadline_shift_scale: float = 0.1,
+        dynamic_energy_duration: int = 2,
+        dynamic_energy_scale: float = 0.2,
+        dynamic_seed: int | None = None,
     ):
         self.number_of_jobs = n_j
         self.number_of_machines = n_m
@@ -66,6 +77,159 @@ class MOFJSPEnvForVariousOpNums(FJSPEnvForVariousOpNums):
                 f"Multipliers for {data_source_key} with {self.number_of_jobs} jobs and {self.number_of_machines} machines not found. Using default multipliers."
             )
             self.multipliers = MULTIPLIERS["BenchData"]
+
+        self.dynamic_event_engine = DynamicEventEngine(
+            enabled=dynamic_events_enabled,
+            event_prob=dynamic_event_prob,
+            event_types=dynamic_event_types,
+            breakdown_duration=dynamic_breakdown_duration,
+            deadline_shift_scale=dynamic_deadline_shift_scale,
+            energy_duration=dynamic_energy_duration,
+            energy_scale=dynamic_energy_scale,
+            seed=dynamic_seed,
+        )
+        self._base_costs_data = None
+        self._base_true_costs_data = None
+
+    def _sync_runtime_arrays_from_state(self):
+        """
+        Keep runtime numpy arrays consistent with the current state snapshot.
+
+        Base reset() restores self.state, but runtime arrays used by dynamic
+        event hooks are not all reassigned there.
+        """
+        self.fea_j = self.state.fea_j_tensor.detach().cpu().numpy()
+        self.op_mask = self.state.op_mask_tensor.detach().cpu().numpy()
+        self.fea_m = self.state.fea_m_tensor.detach().cpu().numpy()
+        self.mch_mask = self.state.mch_mask_tensor.detach().cpu().numpy()
+        self.dynamic_pair_mask = (
+            self.state.dynamic_pair_mask_tensor.detach().cpu().numpy().astype(bool)
+        )
+        self.comp_idx = self.state.comp_idx_tensor.detach().cpu().numpy()
+        self.candidate = self.state.candidate_tensor.detach().cpu().numpy()
+        self.fea_pairs = self.state.fea_pairs_tensor.detach().cpu().numpy()
+
+    def set_initial_data(self, job_length_list, op_pt_list, deadline_alpha=1.0):
+        state = super().set_initial_data(job_length_list, op_pt_list, deadline_alpha)
+        self._base_costs_data = np.copy(self.costs.data)
+        self._base_true_costs_data = np.copy(self.true_costs.data)
+        self.dynamic_event_engine.reset(
+            num_envs=self.number_of_envs,
+            num_jobs=self.number_of_jobs,
+            num_machines=self.number_of_machines,
+        )
+        self._apply_dynamic_events_after_transition(
+            done_mask=np.zeros(self.number_of_envs, dtype=bool),
+            apply_sampling=False,
+        )
+        self._refresh_state_with_event_context()
+        self.old_state = copy.deepcopy(self.state)
+        return self.state
+
+    def reset(self):
+        state = super().reset()
+        self._sync_runtime_arrays_from_state()
+        self.dynamic_event_engine.reset(
+            num_envs=self.number_of_envs,
+            num_jobs=self.number_of_jobs,
+            num_machines=self.number_of_machines,
+        )
+        self._apply_dynamic_events_after_transition(
+            done_mask=np.zeros(self.number_of_envs, dtype=bool),
+            apply_sampling=False,
+        )
+        self._refresh_state_with_event_context()
+        self.old_state = copy.deepcopy(self.state)
+        return self.state
+
+    def step(self, actions):
+        state, reward, done = super().step(actions)
+        done_mask = np.asarray(done).astype(bool)
+        self._apply_dynamic_events_after_transition(done_mask=done_mask, apply_sampling=True)
+        self._refresh_state_with_event_context()
+        return self.state, reward, done
+
+    def _apply_dynamic_events_after_transition(self, done_mask, apply_sampling: bool):
+        if apply_sampling:
+            snapshot = self.dynamic_event_engine.sample(
+                current_deadlines=self.deadlines,
+                done_mask=done_mask,
+            )
+        else:
+            snapshot = self.dynamic_event_engine.sample(
+                current_deadlines=self.deadlines,
+                done_mask=np.ones_like(done_mask, dtype=bool),
+            )
+
+        if snapshot.deadline_delta.shape == self.deadlines.shape:
+            self.deadlines = np.maximum(self.deadlines + snapshot.deadline_delta, 1e-8)
+            self.true_deadlines = (
+                self.deadlines * (self.pt_upper_bound - self.pt_lower_bound + 1e-8)
+                + self.pt_lower_bound
+            )
+            self.compute_tardiness_features()
+            self.compute_flowtime_features()
+            self.construct_op_features()
+
+        if (
+            self._base_costs_data is not None
+            and snapshot.energy_multiplier.shape[0] == self.number_of_envs
+        ):
+            self.cost_lb = self.cost_lb.astype(np.float64, copy=False)
+            self.true_cost_lb = self.true_cost_lb.astype(np.float64, copy=False)
+            old_min_cost = ma.min(self.costs, axis=-1).filled(0.0)
+            old_min_true_cost = ma.min(self.true_costs, axis=-1).filled(0.0)
+            energy = snapshot.energy_multiplier[:, None, :]
+            self.costs = ma.array(
+                self._base_costs_data * energy,
+                mask=self.reverse_process_relation,
+            )
+            self.true_costs = ma.array(
+                self._base_true_costs_data * energy,
+                mask=self.reverse_process_relation,
+            )
+            new_min_cost = ma.min(self.costs, axis=-1).filled(0.0)
+            new_min_true_cost = ma.min(self.true_costs, axis=-1).filled(0.0)
+            unscheduled_mask = (self.op_scheduled_flag == 0).astype(np.float64)
+            self.cost_lb += np.sum(
+                (new_min_cost - old_min_cost) * unscheduled_mask, axis=1
+            )
+            self.true_cost_lb += np.sum(
+                (new_min_true_cost - old_min_true_cost) * unscheduled_mask, axis=1
+            )
+
+        prev_dynamic_pair_mask = np.copy(self.dynamic_pair_mask)
+        breakdown_mask = snapshot.breakdown_mask
+        if breakdown_mask.shape == (self.number_of_envs, self.number_of_machines):
+            self.dynamic_pair_mask = np.logical_or(
+                self.dynamic_pair_mask, breakdown_mask[:, None, :]
+            )
+            invalid_envs = self.dynamic_pair_mask.reshape(self.number_of_envs, -1).all(
+                axis=1
+            )
+            self.dynamic_pair_mask[invalid_envs] = prev_dynamic_pair_mask[invalid_envs]
+
+            self.comp_idx = self.logic_operator(x=~self.dynamic_pair_mask)
+            self.update_mch_mask()
+            self.mch_current_available_jc_nums = np.sum(~self.dynamic_pair_mask, axis=1)
+            self.construct_mch_features()
+            self.construct_pair_features()
+
+    def _refresh_state_with_event_context(self):
+        event_context = self.dynamic_event_engine.build_global_context()
+        event_mch = self.dynamic_event_engine.build_machine_context()
+        self.state.update(
+            self.fea_j,
+            self.op_mask,
+            self.fea_m,
+            self.mch_mask,
+            self.dynamic_pair_mask,
+            self.comp_idx,
+            self.candidate,
+            self.fea_pairs,
+            event_context=event_context,
+            event_mch=event_mch,
+        )
 
     def construct_op_features(self):
         if self.use_lb_features:
