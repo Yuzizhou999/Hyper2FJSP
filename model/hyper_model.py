@@ -42,17 +42,24 @@ class HYPER_DANIEL(nn.Module):
             len(config.objective_fn) if isinstance(config.objective_fn, list) else 2
         )
 
-        # 各种高级特性的开启标志位
+        # 功能开关
+        # 是否引入基于实例特征的动态超网络权重生成
         self.use_instance_features = getattr(
             config, "hyper_use_instance_features", False
         )
-        self.condition_encoder = getattr(config, "hyper_condition_encoder", False)
+        # 是否在编码器端引入条件调节机制
+        self.condition_encoder = getattr(
+            config, "hyper_condition_encoder", False
+        )
+        # 编码器条件调节机制中是否使用 FiLM 层来直接调节特征
         self.hyper_encoder_use_film = getattr(
             config, "hyper_encoder_use_film", True
         )
+        # 编码器条件调节机制中是否使用注意力层来融合偏好信息
         self.hyper_encoder_use_attention = getattr(
             config, "hyper_encoder_use_attention", True
         )
+        # 是否启用事件级超网络适配器来动态调整 Actor 权重，用于动态环境
         self.use_event_hypernetwork = bool(
             getattr(config, "hyper_event_adapter_enabled", False)
         )

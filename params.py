@@ -125,6 +125,12 @@ parser.add_argument('--test_data', nargs='+', default=['20x10+mix'], help='List 
 parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether using the sampling strategy in testing')
 parser.add_argument('--sample_times', type=int, default=10, help='Sampling times for the sampling strategy')
 parser.add_argument('--num_sampling_cycles', type=int, default=1, help='Number of sampling cycles to run (results stored per cycle)')
+parser.add_argument('--num_test_scenarios', type=int, default=1,
+                    help='Number of random test scenarios (different seeds) to evaluate per model/data pair')
+parser.add_argument('--test_seed_stride', type=int, default=1,
+                    help='Stride when auto-generating multi-scenario test seeds from seed_test')
+parser.add_argument('--test_seed_list', nargs='*', type=int, default=None,
+                    help='Optional explicit list of test seeds; overrides num_test_scenarios/stride when provided')
 parser.add_argument('--test_model', nargs='+', default=['20x10+mix_MO'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=[], help='List of heuristic methods for testing')
 # new args

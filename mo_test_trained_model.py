@@ -32,6 +32,17 @@ ppo = PPO_initialize(multi_objective=True)
 test_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
 
 
+def resolve_test_seeds(config):
+    explicit_seeds = getattr(config, "test_seed_list", None)
+    if explicit_seeds:
+        return [int(seed) for seed in explicit_seeds]
+
+    base_seed = int(getattr(config, "seed_test", 0))
+    num_scenarios = int(max(1, getattr(config, "num_test_scenarios", 1)))
+    seed_stride = int(max(1, getattr(config, "test_seed_stride", 1)))
+    return [base_seed + i * seed_stride for i in range(num_scenarios)]
+
+
 def save_pareto_sets(pareto_sets, data_source, data_name, model_name, strategy):
     """
     将生成的帕累托前沿集合（Pareto Sets）保存到本地磁盘。
@@ -165,6 +176,7 @@ def test_greedy_strategy(
     data_source=None,
     data_name=None,
     num_preferences=101,
+    strategy_tag="greedy",
 ):
     """
     使用贪婪策略（Greedy Strategy）在提供的测试数据集上测试并评估训练好的超网络强化模型。反向使用推断所得的目标解求取前沿。
@@ -215,7 +227,7 @@ def test_greedy_strategy(
         ),
         dynamic_energy_duration=getattr(configs, "dynamic_energy_duration", 2),
         dynamic_energy_scale=getattr(configs, "dynamic_energy_scale", 0.2),
-        dynamic_seed=getattr(configs, "seed_test", None),
+        dynamic_seed=seed,
     )
 
     performance_metrics = defaultdict(list)
@@ -367,13 +379,13 @@ def test_greedy_strategy(
                 data_source,
                 data_name,
                 model_name,
-                "greedy",
+                strategy_tag,
                 i,
             )
 
     # Save the Pareto sets if model_name is provided
     if model_name and data_source and data_name:
-        save_pareto_sets(pareto_sets, data_source, data_name, model_name, "greedy")
+        save_pareto_sets(pareto_sets, data_source, data_name, model_name, strategy_tag)
 
     return np.array(test_result_list), performance_metrics
 
@@ -390,6 +402,7 @@ def test_sampling_strategy(
     data_name=None,
     num_preferences=101,
     num_sampling_cycles=1,
+    strategy_tag="sampling",
 ):
     test_result_list = []
     all_cycles_pareto_sets = []  # Store pareto sets for each cycle
@@ -423,7 +436,7 @@ def test_sampling_strategy(
         ),
         dynamic_energy_duration=getattr(configs, "dynamic_energy_duration", 2),
         dynamic_energy_scale=getattr(configs, "dynamic_energy_scale", 0.2),
-        dynamic_seed=getattr(configs, "seed_test", None),
+        dynamic_seed=seed,
     )
 
     performance_metrics = defaultdict(list)
@@ -648,7 +661,10 @@ def test_sampling_strategy(
 
                 if num_sampling_cycles > 1:
                     # 在保存路径中插入当前周期序号
-                    save_dir = f"./pareto_sets/{data_source}/{data_name}/{model_name}_sampling_cycle{cycle + 1}"
+                    save_dir = (
+                        f"./pareto_sets/{data_source}/{data_name}/"
+                        f"{model_name}_{strategy_tag}_cycle{cycle + 1}"
+                    )
                     if not os.path.exists(save_dir):
                         os.makedirs(save_dir)
                     save_path = f"{save_dir}/instance_{i}.npy"
@@ -656,7 +672,7 @@ def test_sampling_strategy(
                 else:
                     # 仅具有一轮采样循环的原有保存处理逻辑
                     save_dir = (
-                        f"./pareto_sets/{data_source}/{data_name}/{model_name}_sampling"
+                        f"./pareto_sets/{data_source}/{data_name}/{model_name}_{strategy_tag}"
                     )
                     if not os.path.exists(save_dir):
                         os.makedirs(save_dir)
@@ -671,9 +687,11 @@ def test_sampling_strategy(
                     data_source,
                     data_name,
                     model_name,
-                    f"sampling_cycle{cycle + 1}"
-                    if num_sampling_cycles > 1
-                    else "sampling",
+                    (
+                        f"{strategy_tag}_cycle{cycle + 1}"
+                        if num_sampling_cycles > 1
+                        else strategy_tag
+                    ),
                     i,
                 )
 
@@ -682,117 +700,142 @@ def test_sampling_strategy(
 
 def main(config, flag_sample):
     """
-        据配置文件读取经过训练的模型，验证并保存测试结果
-    :param flag_sample: 是否使用采样探索策略（而非贪婪推断）
+    Load trained models, run tests, and save summarized outputs.
+    :param flag_sample: True for sampling policy, False for greedy policy.
     """
     setup_seed(config.seed_test)
     objective_fn = [ObjectiveFn(str(obj_fn).lower()) for obj_fn in config.objective_fn]
     if not os.path.exists("./test_results"):
         os.makedirs("./test_results")
 
-    # 汇集需要验证测试的模型路径
     test_model = []
-
     for model_name in config.test_model:
         test_model.append(
             (f"./trained_network/{config.model_source}/{model_name}.pth", model_name)
         )
 
-    # 读取提取所有需要测试的验证数据
     test_data, test_reference_points = pack_data_from_config(
         config.data_source, config.test_data, load_reference_points=True
     )
 
     if ObjectiveFn.NEGATIVE_MAKESPAN in objective_fn:
-        test_reference_points[0] = (
-            np.concatenate(
-                (
-                    np.array(test_reference_points[0][0]),
-                    np.zeros((np.array(test_reference_points[0][0]).shape[0], 1)),
-                ),
+        updated_reference_points = []
+        for reference_points, reference_name in test_reference_points:
+            reference_points = np.array(reference_points)
+            reference_points = np.concatenate(
+                (reference_points, np.zeros((reference_points.shape[0], 1))),
                 axis=1,
-            ),
-            test_reference_points[0][1],
-        )
+            )
+            updated_reference_points.append((reference_points, reference_name))
+        test_reference_points = updated_reference_points
 
-    # 确认测试模式决定模型的前缀名称
-    if flag_sample:
-        model_prefix = "DANIELS"
-    else:
-        model_prefix = "DANIELG"
+    test_seeds = resolve_test_seeds(config)
+    print(f"Test scenario seeds: {test_seeds}")
 
-    for data in test_data:
+    model_prefix = "DANIELS" if flag_sample else "DANIELG"
+
+    for data_idx, (data_payload, data_name) in enumerate(test_data):
+        reference_points, reference_name = test_reference_points[data_idx]
+        if data_name != reference_name:
+            print(
+                f"Warning: data/reference mismatch ({data_name} vs {reference_name}); "
+                "using paired order from pack_data_from_config."
+            )
+
         print("-" * 25 + "Test Learned Model" + "-" * 25)
-        print(f"test data name: {data[1]}")
+        print(f"test data name: {data_name}")
         print(f"test mode: {model_prefix}")
-        save_direc = f"./test_results/{config.data_source}/{data[1]}"
+        save_direc = f"./test_results/{config.data_source}/{data_name}"
         if not os.path.exists(save_direc):
             os.makedirs(save_direc)
 
-        for model in test_model:
-            save_path = save_direc + f"/Result_{model_prefix}+{model[1]}_{data[1]}.npy"
+        for model_path, model_name in test_model:
+            save_path = save_direc + f"/Result_{model_prefix}+{model_name}_{data_name}.npy"
             if (not os.path.exists(save_path)) or config.cover_flag:
-                print(f"Model name : {model[1]}")
-                print(f"data name: ./data/{config.data_source}/{data[1]}")
+                print(f"Model name : {model_name}")
+                print(f"data name: ./data/{config.data_source}/{data_name}")
 
-                if not flag_sample:
-                    print("Test mode: Greedy")
-                    result_5_times = []
-                    # 贪婪推理模式，共测试1次（若曾设定为多次可求平减小误差），记录推断耗时。
-                    for j in range(1):
-                        result, performance_metrics = test_greedy_strategy(
-                            data[0],
-                            model[0],
-                            config.seed_test,
-                            objective_fn=objective_fn,
-                            reference_points=np.array(test_reference_points[0][0]),
-                            model_name=model[1],
-                            data_source=config.data_source,
-                            data_name=data[1],
-                            num_preferences=config.num_preferences_test,
+                scenario_results = []
+                aggregated_metrics = defaultdict(list)
+                for seed in test_seeds:
+                    if not flag_sample:
+                        strategy_tag = (
+                            "greedy" if len(test_seeds) == 1 else f"greedy_seed{seed}"
                         )
-                        # result, performance_metrics = test_sampling_strategy(data[0], model[0], 10, config.seed_test, objective_fn=objective_fn, reference_points=np.array(test_reference_points[0][0]))
-                        result_5_times.append(result)
-                    result_5_times = np.array(result_5_times)
-
-                    save_result = np.mean(result_5_times, axis=0)
-                    print("测试输出结果:")
-                    print("目标值 (Greedy 贪婪模式): ", save_result[:, 0].mean())
-                    print("位于帕累托非支配集内的解个数: ", save_result[:, 1].mean())
-                    print(
-                        f"性能评测指标: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
-                    )
-                    print("耗时: ", save_result[:, 2].mean())
-
-                else:
-                    print("Test mode: Sampling")
-                    result_5_times = []
-                    # 采样模式，测试运行并记录耗费时间。
-                    for j in range(1):
-                        result, performance_metrics = test_sampling_strategy(
-                            data[0],
-                            model[0],
-                            config.sample_times,
-                            config.seed_test,
+                        result, performance_metrics = test_greedy_strategy(
+                            data_payload,
+                            model_path,
+                            seed,
                             objective_fn=objective_fn,
-                            reference_points=np.array(test_reference_points[0][0]),
-                            model_name=model[1],
+                            reference_points=np.array(reference_points),
+                            model_name=model_name,
                             data_source=config.data_source,
-                            data_name=data[1],
+                            data_name=data_name,
+                            num_preferences=config.num_preferences_test,
+                            strategy_tag=strategy_tag,
+                        )
+                    else:
+                        strategy_tag = (
+                            "sampling" if len(test_seeds) == 1 else f"sampling_seed{seed}"
+                        )
+                        result, performance_metrics = test_sampling_strategy(
+                            data_payload,
+                            model_path,
+                            config.sample_times,
+                            seed,
+                            objective_fn=objective_fn,
+                            reference_points=np.array(reference_points),
+                            model_name=model_name,
+                            data_source=config.data_source,
+                            data_name=data_name,
                             num_preferences=config.num_preferences_test,
                             num_sampling_cycles=config.num_sampling_cycles,
+                            strategy_tag=strategy_tag,
                         )
-                        result_5_times.append(result)
-                    result_5_times = np.array(result_5_times)
+                    scenario_results.append(result)
+                    for metric_name, metric_values in performance_metrics.items():
+                        aggregated_metrics[metric_name].append(np.mean(metric_values))
 
-                    save_result = np.mean(result_5_times, axis=0)
-                    print("测试输出结果:")
-                    print("目标值 (Sampling 采样模式): ", save_result[:, 0].mean())
-                    print("位于帕累托非支配集内的解个数: ", save_result[:, 1].mean())
+                scenario_results = np.array(scenario_results)
+                save_result = np.mean(scenario_results, axis=0)
+                save_std = np.std(scenario_results, axis=0)
+
+                np.save(save_path, save_result)
+                np.savez(
+                    save_path.replace(".npy", ".npz"),
+                    seeds=np.array(test_seeds),
+                    per_seed_results=scenario_results,
+                    mean=save_result,
+                    std=save_std,
+                )
+
+                hv_values = scenario_results[:, :, 0]
+                pareto_sizes = scenario_results[:, :, 1]
+                runtime_values = scenario_results[:, :, 2]
+                mode_name = "Sampling" if flag_sample else "Greedy"
+                print("Test summary:")
+                print(
+                    f"Normalized HV ({mode_name}): {hv_values.mean():.6f} +/- {hv_values.std():.6f}"
+                )
+                print(
+                    "Pareto set size:"
+                    f" {pareto_sizes.mean():.2f} +/- {pareto_sizes.std():.2f}"
+                )
+                print(
+                    f"Runtime (s): {runtime_values.mean():.4f} +/- {runtime_values.std():.4f}"
+                )
+                if aggregated_metrics:
+                    metric_summary = {
+                        metric_name: (
+                            float(np.mean(metric_values)),
+                            float(np.std(metric_values)),
+                        )
+                        for metric_name, metric_values in aggregated_metrics.items()
+                    }
                     print(
-                        f"性能评测指标: {dict(zip(performance_metrics.keys(), map(np.mean, performance_metrics.values())))}"
+                        "Performance metrics (mean +/- std across scenarios):"
+                        f" {metric_summary}"
                     )
-                    print("耗时: ", save_result[:, 2].mean())
 
 
 if __name__ == "__main__":
