@@ -231,8 +231,18 @@ class Trainer:
             ep_et = time.time()
 
             # print the reward, makespan, loss and training time of the current episode
+            extra_train_metrics = ""
+            if hasattr(self, "ppo") and getattr(
+                self.ppo, "last_corner_distill_loss", 0.0
+            ):
+                extra_train_metrics = (
+                    "\t corner distill: {:.8f}\t gate mass: {:.2f}".format(
+                        self.ppo.last_corner_distill_loss,
+                        getattr(self.ppo, "last_corner_distill_gate_mass", 0.0),
+                    )
+                )
             tqdm.write(
-                "Episode {}\t reward: {}\t makespan: {:.2f}\t avg flowtime: {:.2f}\t total tardiness: {:.2f}\t total earliness: {:.2f}\t total costs: {:.2f}\t Mean_loss: {:.8f}\t  training time: {:.2f}".format(
+                "Episode {}\t reward: {}\t makespan: {:.2f}\t avg flowtime: {:.2f}\t total tardiness: {:.2f}\t total earliness: {:.2f}\t total costs: {:.2f}\t Mean_loss: {:.8f}{}\t  training time: {:.2f}".format(
                     i_update + 1,
                     mean_rewards_all_env,
                     mean_makespan_all_env,
@@ -241,6 +251,7 @@ class Trainer:
                     mean_total_earliness_all_env,
                     mean_costs_all_env,
                     loss,
+                    extra_train_metrics,
                     ep_et - ep_st,
                 )
             )

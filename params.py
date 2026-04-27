@@ -25,6 +25,10 @@ parser.add_argument('--device_id', type=str, default='0', help='Device id')
 # args for file_name
 
 parser.add_argument('--model_suffix', type=str, default='', help='Suffix of the model')
+parser.add_argument('--resume_model_name', type=str, default='',
+                    help='Optional checkpoint name/path used to initialize the student before training.')
+parser.add_argument('--resume_model_source', type=str, default='',
+                    help='Source folder for --resume_model_name. Defaults to --model_source when empty.')
 parser.add_argument('--data_suffix', type=str, default='mix', help='Suffix of the data')
 
 # args for AutoExperiment
@@ -133,6 +137,37 @@ parser.add_argument('--deadline_alpha', type=float, default=0.5, help='Deadline 
 
 parser.add_argument('--num_preferences_validation', type=int, default=51, help='Number of preferences for validation')
 parser.add_argument('--num_preferences_test', type=int, default=101, help='Number of preferences for testing')
+parser.add_argument('--fixed_train_preference', nargs='+', type=float, default=None,
+                    help='Fix training preference weights, e.g. --fixed_train_preference 1 0 for a makespan expert or 0 1 for a cost expert. Default: sample random preferences.')
+
+# Corner-specialist distillation. Teachers are used only during training; the saved
+# checkpoint is still a single student policy.
+parser.add_argument('--corner_distill_enable', type=str2bool, default=False,
+                    help='Enable corner-specialist policy distillation during PPO updates.')
+parser.add_argument('--corner_distill_teacher_models', nargs='+', default=[],
+                    help='Teacher checkpoint names/paths for corner distillation.')
+parser.add_argument('--corner_distill_teacher_preferences', nargs='+', default=[],
+                    help='Teacher corner preferences, one per teacher, e.g. 1,0 0,1.')
+parser.add_argument('--corner_distill_teacher_model_source', type=str, default='',
+                    help='Source folder for teacher checkpoints. Defaults to --model_source when empty.')
+parser.add_argument('--corner_distill_coef', type=float, default=0.03,
+                    help='Coefficient for teacher-to-student KL distillation.')
+parser.add_argument('--corner_distill_threshold', type=float, default=0.95,
+                    help='Start applying a teacher when the matching objective weight reaches this threshold.')
+parser.add_argument('--corner_distill_gate_power', type=float, default=2.0,
+                    help='Power used by the smooth corner gate.')
+parser.add_argument('--corner_distill_temperature', type=float, default=1.0,
+                    help='Temperature applied to teacher/student action distributions in distillation.')
+parser.add_argument('--corner_distill_start_update', type=int, default=0,
+                    help='Do not apply distillation before this PPO update index.')
+parser.add_argument('--corner_distill_ramp_updates', type=int, default=0,
+                    help='Linearly ramp distillation strength over this many updates after start.')
+parser.add_argument('--corner_distill_preference_bias_ratio', type=float, default=0.5,
+                    help='Fraction of training environments biased toward teacher corners when distillation is enabled.')
+parser.add_argument('--corner_distill_preference_min_weight', type=float, default=0.95,
+                    help='Minimum dominant objective weight for corner-biased sampled preferences.')
+parser.add_argument('--corner_distill_exact_corner_ratio', type=float, default=0.25,
+                    help='Fraction of biased preferences set exactly to teacher corners.')
 
 # Add model architecture parameter with hardcoded possible values in the help description
 parser.add_argument(

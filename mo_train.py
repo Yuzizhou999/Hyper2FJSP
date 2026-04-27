@@ -1,5 +1,6 @@
 import copy
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,12 +17,17 @@ from enums import ObjectiveFn
 from hypervolume_utils import compute_hypervolume
 from mo_fjsp_env_same_op_nums import MOFJSPEnvForSameOpNums
 from mo_fjsp_env_various_op_nums import MOFJSPEnvForVariousOpNums
+from model.PPO import build_policy
 
 
 class MOTrainer(train.Trainer):
     def __init__(self, config):
         super().__init__(config, multi_objective=True)
-        self.device = config.device
+        self.device = torch.device(config.device)
+        self.current_update = 0
+        self.corner_distill_teacher_specs = []
+        self._maybe_load_resume_model()
+        self._setup_corner_distillation()
 
     def _set_objective_fn(self, objective_fns: list[str]):
         self.objective_fn = [
@@ -171,8 +177,227 @@ class MOTrainer(train.Trainer):
                     "_".join(encoder_bits) if encoder_bits else "off"
                 )
 
+        fixed_pref_suffix = ""
+        fixed_pref = getattr(config, "fixed_train_preference", None)
+        if fixed_pref is not None:
+            fixed_pref = np.asarray(fixed_pref, dtype=np.float32)
+            if fixed_pref.size == len(self.objective_fn):
+                pref_sum = float(fixed_pref.sum())
+                if pref_sum > 0:
+                    fixed_pref = fixed_pref / pref_sum
+                    pref_bits = "_".join(f"{float(x):g}" for x in fixed_pref)
+                    main_obj = self.objective_fn[int(np.argmax(fixed_pref))].value
+                    fixed_pref_suffix = f"_expert_{main_obj[:3]}_pref_{pref_bits}"
+
+        corner_distill_suffix = ""
+        if getattr(config, "corner_distill_enable", False):
+            fmt = lambda x: f"{float(x):g}".replace(".", "p")
+            corner_distill_suffix = (
+                f"_cdist_t{fmt(getattr(config, 'corner_distill_threshold', 0.95))}"
+                f"_l{fmt(getattr(config, 'corner_distill_coef', 0.03))}"
+            )
+
         # Create the model name with the objective suffix
-        self.model_name = f"{self.data_name}{strToSuffix(config.model_suffix)}_{config.model_architecture.value}{hyper_mode_suffix}{'_no_trans' if config.use_gamma_beta is False else ''}{'_large' if config.hidden_dim_actor > 65 else ''}{obj_suffix}{single_critic_suffix}{simple_reward_suffix}{no_lb_suffix}_MO"
+        self.model_name = f"{self.data_name}{strToSuffix(config.model_suffix)}_{config.model_architecture.value}{hyper_mode_suffix}{'_no_trans' if config.use_gamma_beta is False else ''}{'_large' if config.hidden_dim_actor > 65 else ''}{obj_suffix}{fixed_pref_suffix}{corner_distill_suffix}{single_critic_suffix}{simple_reward_suffix}{no_lb_suffix}_MO"
+
+    def _get_fixed_train_preference(self):
+        fixed_pref = getattr(self.config, "fixed_train_preference", None)
+        if fixed_pref is None:
+            return None
+
+        fixed_pref = np.asarray(fixed_pref, dtype=np.float32)
+        if fixed_pref.ndim != 1 or fixed_pref.size != self.num_objectives:
+            raise ValueError(
+                f"--fixed_train_preference must contain {self.num_objectives} weights, got {fixed_pref.tolist()}"
+            )
+        if np.any(fixed_pref < 0):
+            raise ValueError("--fixed_train_preference weights must be non-negative")
+        pref_sum = float(fixed_pref.sum())
+        if pref_sum <= 0:
+            raise ValueError("--fixed_train_preference must have positive sum")
+        return fixed_pref / pref_sum
+
+    def _resolve_checkpoint_path(self, model_name, model_source):
+        if not model_name:
+            raise ValueError("Empty checkpoint name.")
+
+        direct_path = Path(model_name)
+        if direct_path.exists():
+            return direct_path
+
+        if direct_path.suffix != ".pth":
+            direct_path = Path(f"{model_name}.pth")
+            if direct_path.exists():
+                return direct_path
+
+        source = model_source or self.config.model_source
+        checkpoint_name = model_name if str(model_name).endswith(".pth") else f"{model_name}.pth"
+        checkpoint_path = Path("trained_network") / source / checkpoint_name
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        return checkpoint_path
+
+    def _parse_preference(self, preference_text):
+        pieces = str(preference_text).replace(";", ",").split(",")
+        values = np.asarray([float(piece) for piece in pieces], dtype=np.float32)
+        if values.ndim != 1 or values.size != self.num_objectives:
+            raise ValueError(
+                f"Preference '{preference_text}' must contain {self.num_objectives} values."
+            )
+        if np.any(values < 0):
+            raise ValueError(f"Preference '{preference_text}' contains negative values.")
+        pref_sum = float(values.sum())
+        if pref_sum <= 0:
+            raise ValueError(f"Preference '{preference_text}' has non-positive sum.")
+        return values / pref_sum
+
+    def _maybe_load_resume_model(self):
+        resume_model_name = getattr(self.config, "resume_model_name", "")
+        if not resume_model_name:
+            return
+
+        resume_source = getattr(self.config, "resume_model_source", "") or self.config.model_source
+        checkpoint_path = self._resolve_checkpoint_path(resume_model_name, resume_source)
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
+        self.ppo.policy.load_state_dict(state_dict)
+        self.ppo.policy_old.load_state_dict(self.ppo.policy.state_dict())
+        print(f"Loaded student initialization from {checkpoint_path}")
+
+    def _setup_corner_distillation(self):
+        if not getattr(self.config, "corner_distill_enable", False):
+            return
+
+        teacher_models = list(getattr(self.config, "corner_distill_teacher_models", []))
+        teacher_preferences = list(
+            getattr(self.config, "corner_distill_teacher_preferences", [])
+        )
+        if not teacher_models:
+            raise ValueError(
+                "--corner_distill_enable requires --corner_distill_teacher_models."
+            )
+        if len(teacher_models) != len(teacher_preferences):
+            raise ValueError(
+                "--corner_distill_teacher_models and "
+                "--corner_distill_teacher_preferences must have the same length."
+            )
+
+        teacher_source = (
+            getattr(self.config, "corner_distill_teacher_model_source", "")
+            or self.config.model_source
+        )
+        specs = []
+        for model_name, preference_text in zip(teacher_models, teacher_preferences):
+            preference_np = self._parse_preference(preference_text)
+            checkpoint_path = self._resolve_checkpoint_path(model_name, teacher_source)
+            teacher_policy = build_policy(self.config, multi_objective=True)
+            teacher_policy.load_state_dict(
+                torch.load(checkpoint_path, map_location=self.device)
+            )
+            teacher_policy.eval()
+            for param in teacher_policy.parameters():
+                param.requires_grad_(False)
+
+            objective_index = int(np.argmax(preference_np))
+            specs.append(
+                {
+                    "policy": teacher_policy,
+                    "preference": torch.from_numpy(preference_np)
+                    .float()
+                    .to(self.device),
+                    "preference_np": preference_np,
+                    "objective_index": objective_index,
+                    "model_name": model_name,
+                    "checkpoint_path": str(checkpoint_path),
+                }
+            )
+
+        self.corner_distill_teacher_specs = specs
+        self.ppo.set_corner_distillation(
+            specs,
+            coef=getattr(self.config, "corner_distill_coef", 0.03),
+            threshold=getattr(self.config, "corner_distill_threshold", 0.95),
+            gate_power=getattr(self.config, "corner_distill_gate_power", 2.0),
+            temperature=getattr(self.config, "corner_distill_temperature", 1.0),
+        )
+        print(
+            "Loaded corner distillation teachers: "
+            + ", ".join(
+                f"{spec['model_name']}@{spec['preference_np'].tolist()}"
+                for spec in specs
+            )
+        )
+
+    def _sample_random_preferences(self):
+        objective_weights = np.random.rand(self.num_envs, self.num_objectives)
+        objective_weights = objective_weights / objective_weights.sum(
+            axis=1, keepdims=True
+        )
+        return objective_weights.astype(np.float32)
+
+    def _sample_corner_biased_preferences(self):
+        objective_weights = self._sample_random_preferences()
+        if (
+            not getattr(self.config, "corner_distill_enable", False)
+            or not self.corner_distill_teacher_specs
+        ):
+            return objective_weights
+
+        bias_ratio = float(
+            np.clip(getattr(self.config, "corner_distill_preference_bias_ratio", 0.0), 0.0, 1.0)
+        )
+        num_biased = int(round(self.num_envs * bias_ratio))
+        if num_biased <= 0:
+            return objective_weights
+
+        min_weight = float(
+            np.clip(
+                getattr(self.config, "corner_distill_preference_min_weight", 0.95),
+                0.0,
+                1.0,
+            )
+        )
+        exact_ratio = float(
+            np.clip(getattr(self.config, "corner_distill_exact_corner_ratio", 0.25), 0.0, 1.0)
+        )
+        exact_count = int(round(num_biased * exact_ratio))
+        env_indices = np.random.choice(self.num_envs, num_biased, replace=False)
+
+        for rank, env_idx in enumerate(env_indices):
+            spec = self.corner_distill_teacher_specs[
+                np.random.randint(len(self.corner_distill_teacher_specs))
+            ]
+            objective_index = spec["objective_index"]
+            if rank < exact_count:
+                objective_weights[env_idx] = spec["preference_np"]
+                continue
+
+            dominant_weight = np.random.uniform(min_weight, 1.0)
+            rest = np.random.rand(self.num_objectives).astype(np.float32)
+            rest[objective_index] = 0.0
+            rest_sum = float(rest.sum())
+            if rest_sum <= 0:
+                objective_weights[env_idx] = spec["preference_np"]
+                continue
+
+            weights = rest / rest_sum * (1.0 - dominant_weight)
+            weights[objective_index] = dominant_weight
+            objective_weights[env_idx] = weights
+
+        return objective_weights.astype(np.float32)
+
+    def _corner_distill_scale(self):
+        if not getattr(self.config, "corner_distill_enable", False):
+            return 0.0
+
+        start_update = int(getattr(self.config, "corner_distill_start_update", 0))
+        if self.current_update < start_update:
+            return 0.0
+
+        ramp_updates = int(getattr(self.config, "corner_distill_ramp_updates", 0))
+        if ramp_updates <= 0:
+            return 1.0
+
+        return min(1.0, (self.current_update - start_update + 1) / ramp_updates)
 
     def _set_initial_rewards(self):
         # Initialize episode rewards to zero
@@ -185,6 +410,7 @@ class MOTrainer(train.Trainer):
         return ep_rewards
 
     def _initialize_episode(self, i_update):
+        self.current_update = i_update
         ep_st = time.time()
         # resampling the training data
         if i_update % self.reset_env_timestep == 0:
@@ -195,11 +421,15 @@ class MOTrainer(train.Trainer):
         else:
             state = self.env.reset()
 
-        # Generate new objective weights for this episode
-        objective_weights = np.random.rand(self.num_envs, self.num_objectives)
-        self.objective_weights = objective_weights / objective_weights.sum(
-            axis=1, keepdims=True
-        )
+        # Generate new objective weights for this episode, or keep a fixed
+        # one-hot preference when training a corner expert.
+        fixed_pref = self._get_fixed_train_preference()
+        if fixed_pref is None:
+            self.objective_weights = self._sample_corner_biased_preferences()
+        else:
+            self.objective_weights = np.repeat(
+                fixed_pref[None, :], self.num_envs, axis=0
+            )
         self.objective_weights_tensor = (
             torch.from_numpy(self.objective_weights).float().to(self.device)
         )
@@ -244,12 +474,72 @@ class MOTrainer(train.Trainer):
                 self.memory,
                 self.objective_weights_tensor,
                 self.single_value_critic,
+                corner_distill_scale=self._corner_distill_scale(),
             )
         else:
-            loss, v_loss = self.ppo.update(self.memory, self.objective_weights_tensor)
+            loss, v_loss = self.ppo.update(
+                self.memory,
+                self.objective_weights_tensor,
+                corner_distill_scale=self._corner_distill_scale(),
+            )
         return loss, v_loss
 
+    def _validate_fixed_preference_expert(self):
+        fixed_pref = self._get_fixed_train_preference()
+        if fixed_pref is None:
+            return None
+
+        self.ppo.policy.eval()
+        state = self.vali_env.reset()
+        fixed_pref_tensor = (
+            torch.from_numpy(fixed_pref).float().to(self.device).unsqueeze(0)
+        )
+
+        while True:
+            with torch.no_grad():
+                batch_idx = ~torch.from_numpy(self.vali_env.done_flag)
+                batch_size = state.fea_j_tensor[batch_idx].shape[0]
+                preferences = fixed_pref_tensor.repeat(batch_size, 1)
+
+                pi, _ = self.ppo.policy(
+                    fea_j=state.fea_j_tensor[batch_idx],
+                    op_mask=state.op_mask_tensor[batch_idx],
+                    candidate=state.candidate_tensor[batch_idx],
+                    fea_m=state.fea_m_tensor[batch_idx],
+                    mch_mask=state.mch_mask_tensor[batch_idx],
+                    comp_idx=state.comp_idx_tensor[batch_idx],
+                    dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx],
+                    fea_pairs=state.fea_pairs_tensor[batch_idx],
+                    preferences=preferences,
+                )
+
+            action = greedy_select_action(pi)
+            state, _, done = self.vali_env.step(action.cpu().numpy())
+
+            if done.all():
+                break
+
+        self.ppo.policy.train()
+        objective = self.objective_fn[int(np.argmax(fixed_pref))]
+        if objective == ObjectiveFn.MAKESPAN:
+            return self.vali_env.current_makespan
+        if objective == ObjectiveFn.AVERAGE_FLOWTIME:
+            return self.vali_env.compute_avg_flowtime()
+        if objective == ObjectiveFn.TOTAL_TARDINESS:
+            return self.vali_env.compute_total_tardiness()
+        if objective == ObjectiveFn.TOTAL_EARLINESS:
+            return self.vali_env.compute_total_earliness()
+        if objective == ObjectiveFn.COSTS:
+            return self.vali_env.compute_costs()
+        if objective == ObjectiveFn.NEGATIVE_MAKESPAN:
+            return -self.vali_env.current_makespan
+        raise ValueError(f"Unsupported fixed-preference objective: {objective}")
+
     def validate_envs_with_same_op_nums(self, objective_fn):
+        fixed_pref_result = self._validate_fixed_preference_expert()
+        if fixed_pref_result is not None:
+            return fixed_pref_result
+
         self.ppo.policy.eval()
         state = self.vali_env.reset()
         if len(objective_fn) == 2:
@@ -397,6 +687,10 @@ class MOTrainer(train.Trainer):
         return normalized_hypervolumes
 
     def validate_envs_with_various_op_nums(self, objective_fn):
+        fixed_pref_result = self._validate_fixed_preference_expert()
+        if fixed_pref_result is not None:
+            return fixed_pref_result
+
         self.ppo.policy.eval()
         state = self.vali_env.reset()
         if len(objective_fn) == 2:
